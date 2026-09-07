@@ -54,5 +54,5 @@ python3.13 cmdline.py --input test/CT_small.dcm --module cmdline
 ### Testing
 
 ```
-python3.13 test/test_cmdline.py
+python3.13 ../tests/test_cmdline.py
 ```
