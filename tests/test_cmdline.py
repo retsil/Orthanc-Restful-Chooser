@@ -20,15 +20,14 @@ from pathlib import Path
 
 import pydicom
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "framework"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from cmdline import (  # noqa: E402
+from OrthancRC.cmdline import (  # noqa: E402
     CmdLineHost,
-    CmdLineApplication,
     loadApplicationClass,
-    extractMainTags,
-    instanceUUIDFor,
 )
+from OrthancRC.orthanc_util import extractMainTags, instanceUUIDFor  # noqa: E402
+from OrthancRC.examples.clone import CloneInstances  # noqa: E402
 
 DATA_FILE = Path(__file__).resolve().parent / "CT_small.dcm"
 
@@ -43,7 +42,7 @@ class TestCmdLineOutput(unittest.TestCase):
             outputPath = Path(outputDir)
 
             host = CmdLineHost([DATA_FILE], outputPath)
-            app = CmdLineApplication(host)
+            app = CloneInstances(host)
             host.setApplication(app)
 
             # Instances are keyed by their Orthanc instance UUID, not SOPInstanceUID.
@@ -82,8 +81,8 @@ class TestExtractMainTags(unittest.TestCase):
 
 class TestLoadApplicationClass(unittest.TestCase):
     def test_loads_subclass_from_module(self):
-        cls = loadApplicationClass("cmdline")
-        self.assertIs(cls, CmdLineApplication)
+        cls = loadApplicationClass("OrthancRC.examples.clone")
+        self.assertIs(cls, CloneInstances)
 
     def test_module_without_application_raises(self):
         # "os" imports fine but defines no Application subclass.
@@ -93,6 +92,32 @@ class TestLoadApplicationClass(unittest.TestCase):
     def test_unimportable_module_raises(self):
         with self.assertRaises(SystemExit):
             loadApplicationClass("no_such_module_xyz")
+
+    def test_module_broken_at_import_raises(self):
+        # A module that is found but blows up while executing must still be
+        # reported as a SystemExit, not escape as a traceback.
+        with tempfile.TemporaryDirectory() as moduleDir:
+            Path(moduleDir, "broken_at_import.py").write_text(
+                "raise RuntimeError('boom')\n"
+            )
+            sys.path.insert(0, moduleDir)
+            try:
+                with self.assertRaises(SystemExit) as caught:
+                    loadApplicationClass("broken_at_import")
+            finally:
+                sys.path.remove(moduleDir)
+        self.assertIn("RuntimeError", str(caught.exception))
+
+    def test_module_with_syntax_error_raises(self):
+        with tempfile.TemporaryDirectory() as moduleDir:
+            Path(moduleDir, "bad_syntax.py").write_text("def (\n")
+            sys.path.insert(0, moduleDir)
+            try:
+                with self.assertRaises(SystemExit) as caught:
+                    loadApplicationClass("bad_syntax")
+            finally:
+                sys.path.remove(moduleDir)
+        self.assertIn("SyntaxError", str(caught.exception))
 
 
 if __name__ == "__main__":

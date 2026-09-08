@@ -18,7 +18,7 @@ from pathlib import Path
 
 from pydicom.dataset import Dataset
 
-from enums import State, Status
+from .enums import State, Status
 
 
 class Host(ABC):

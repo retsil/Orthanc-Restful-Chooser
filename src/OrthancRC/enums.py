@@ -15,6 +15,7 @@
 
 from enum import IntEnum
 
+# Using IntEnum for compatibility with WG23
 
 class State(IntEnum):
     IDLE = 0

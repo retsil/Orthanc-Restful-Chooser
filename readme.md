@@ -48,11 +48,36 @@ Some additional helper functions are defined in the XIP implementation of WG23. 
 
 Command line 
 ```
-python3.13 cmdline.py --input test/CT_small.dcm --module cmdline
+cd src
+python3.13 -m OrthancRC.cmdline --input ../tests/CT_small.dcm --module OrthancRC.examples.clone
 ```
+
+### Orthanc study browser
+
+Search an Orthanc server and pick studies in a curses list. Without `--module`
+it only prints (and optionally saves) the checked study UUIDs:
+
+```
+python3.13 -m OrthancRC.curses --orthanc-url http://localhost:8042 \
+    --search-patient-surname doe --save-selection selection.json
+```
+
+With `--module` the selection is handed straight to an Application: an
+`OrthancHost` is built over the checked studies and the Application subclass
+found in that module is loaded, wired to the host, and fed every instance of
+every selected study. Output datasets are uploaded back into Orthanc unless
+`--no-upload` is given, and `--output-dir` also writes them to disk.
+
+```
+python3.13 -m OrthancRC.curses --module OrthancRC.examples.clone \
+    --output-dir ./out --no-upload
+```
+
+The module is loaded before the search runs, so a bad `--module` fails
+immediately rather than after studies have been selected.
 
 ### Testing
 
 ```
-python3.13 ../tests/test_cmdline.py
+python3.13 -m unittest discover -s tests -t tests
 ```

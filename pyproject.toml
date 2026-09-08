@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "OrthancRC"
+version = "0.1.0"
+description = "A DICOM PS3.19 (WG23) Host/Application framework backed by Orthanc"
+readme = "readme.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "retsil", email = "moonrover3@protonmail.com" }]
+keywords = ["dicom", "orthanc", "wg23", "ps3.19", "pydicom"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Healthcare Industry",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+
+# The framework itself only needs pydicom; the Orthanc-backed host and the
+# study browser live behind the "orthanc" extra so that a plain Application
+# can be written and tested without a server library.
+dependencies = [
+    "pydicom>=3.0",
+]
+
+[project.optional-dependencies]
+orthanc = ["pyorthanc>=1.20"]
+
+[project.scripts]
+orthancrc-cmdline = "OrthancRC.cmdline.filelist:main"
+# Needs the "orthanc" extra.
+orthancrc-browser = "OrthancRC.curses.browser:main"
+
+[project.urls]
+Homepage = "https://github.com/retsil/"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Application icons are data, not code, and would otherwise be left out of a
+# wheel; see __icon__ in each example.
+[tool.setuptools.package-data]
+"OrthancRC.examples.clone" = ["*.png"]

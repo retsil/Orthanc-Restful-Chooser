@@ -14,8 +14,6 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import argparse
-import copy
-import importlib
 import tempfile
 from pathlib import Path
 
@@ -23,47 +21,16 @@ import pydicom
 from pydicom.dataset import Dataset
 from pydicom.uid import generate_uid
 
-import orthanc_util
-from base import Host, Application
-from enums import (
+from ..base import Host, Application
+from ..enums import (
     State,
     Status,
 )
-    
-from orthanc_util import (
-    PATIENT_TAGS,
-    STUDY_TAGS,
-    SERIES_TAGS,
-    INSTANCE_TAGS,
+from ..loader import loadApplicationClass
+from ..orthanc_util import (
+    extractMainTags,
+    instanceUUIDFor,
 )
-
-_MODULE_DIR = Path(__file__).resolve().parent
-
-# All main DICOM tags, in Patient -> Study -> Series -> Instance order.
-MAIN_TAGS = PATIENT_TAGS + STUDY_TAGS + SERIES_TAGS + INSTANCE_TAGS
-
-
-def instanceUUIDFor(ds: Dataset) -> str:
-    """Orthanc instance UUID derived from the dataset's DICOM identifiers."""
-    return orthanc_util.instanceUUID(
-        str(ds.get("PatientID", "")),
-        str(ds.get("StudyInstanceUID", "")),
-        str(ds.get("SeriesInstanceUID", "")),
-        str(ds.get("SOPInstanceUID", "")),
-    )
-
-
-def extractMainTags(ds: Dataset) -> dict[str, object]:
-    """Pull the main DICOM tags present in ds into a {keyword: value} dict."""
-    tags: dict[str, object] = {}
-    for keyword in MAIN_TAGS:
-        if keyword not in ds:
-            continue
-        value = ds.get(keyword)
-        if value is None or str(value) == "":
-            continue
-        tags[keyword] = value
-    return tags
 
 
 class CmdLineHost(Host):
@@ -113,7 +80,11 @@ class CmdLineHost(Host):
             return False
         ds = self._app.getOutputData(instanceUUID)
         outPath = self._outputDir / f"{instanceUUID}.dcm"
-        ds.save_as(str(outPath))
+        try:
+            ds.save_as(str(outPath), enforce_file_format=True)
+        except Exception as exc:  # noqa: BLE001 - an unwritable dataset is the app's bug
+            self.notifyStatus(Status.ERROR, f"could not write output {instanceUUID}: {exc}")
+            return False
         self.notifyStatus(Status.INFORMATION, f"wrote {outPath}")
         return True
 
@@ -122,45 +93,6 @@ class CmdLineHost(Host):
 
     def notifyStatus(self, value: Status, text: str) -> None:
         print(f"[{value.name}] {text}")
-
-
-class CmdLineApplication(Application):
-    """A minimal command-line Application driven by a Host."""
-    __version__=1.0
-    __icon__=str(_MODULE_DIR / "cmdline-icon.png")
-    __description__="A minimal command-line Application driven by a Host."
-
-    def __init__(self, host: Host) -> None:
-        self._host = host
-        self._outputs: dict[str, Dataset] = {}
-        self._host.notifyStateChanged(State.IDLE)
-
-    def getOutputData(self, instanceUUID: str) -> Dataset:
-        return self._outputs.get(instanceUUID, Dataset())
-
-    def notifyInputAvailable(self, instanceUUID: str, mainTags: dict[str, object], lastData: bool) -> bool:
-        self._host.notifyStateChanged(State.INPROGRESS)
-        self._host.notifyStatus(Status.INFORMATION, f"received input {instanceUUID}")
-
-        # Trivial "processing": copy the input dataset and give it a fresh
-        # SOP Instance UID obtained from the host.
-        ds = copy.deepcopy(self._host.getInputData(instanceUUID))
-        newSopUID = self._host.generateUID()
-        ds.SOPInstanceUID = newSopUID
-        if getattr(ds, "file_meta", None) is not None:
-            ds.file_meta.MediaStorageSOPInstanceUID = newSopUID
-        outputUUID = instanceUUIDFor(ds)
-        self._outputs[outputUUID] = ds
-        outputTags = extractMainTags(ds)
-        self._host.notifyOutputAvailable(outputUUID, outputTags, lastData)
-
-        if lastData:
-            self._host.notifyStateChanged(State.COMPLETED)
-        return True
-
-    def bringApplicationToFront(self) -> bool:
-        # Headless: nothing to raise.
-        return False
 
 
 def collectInputFiles(args: argparse.Namespace) -> list[Path]:
@@ -175,18 +107,6 @@ def collectInputFiles(args: argparse.Namespace) -> list[Path]:
             if line and not line.startswith("#"):
                 files.append(Path(line))
     return files
-
-
-def loadApplicationClass(moduleName: str) -> type[Application]:
-    """Import moduleName and return the Application subclass it defines."""
-    try:
-        module = importlib.import_module(moduleName)
-    except ImportError as exc:
-        raise SystemExit(f"cannot import module {moduleName!r}: {exc}")
-    for obj in vars(module).values():
-        if isinstance(obj, type) and issubclass(obj, Application) and obj is not Application:
-            return obj
-    raise SystemExit(f"module {moduleName!r} defines no Application subclass")
 
 
 def parseArgs(argv: list[str] | None = None) -> argparse.Namespace:
@@ -239,7 +159,11 @@ def main(argv: list[str] | None = None) -> None:
     uids = host.instanceUIDs
     for i, uid in enumerate(uids):
         inputTags = extractMainTags(host.getInputData(uid))
-        app.notifyInputAvailable(uid, inputTags, lastData=(i == len(uids) - 1))
+        # A False return is how the Application cancels processing; stop
+        # feeding it inputs and exit non-zero, as OrthancHost.sendInputs does.
+        if not app.notifyInputAvailable(uid, inputTags, lastData=(i == len(uids) - 1)):
+            host.notifyStatus(Status.WARNING, f"application refused input {uid}, stopping")
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

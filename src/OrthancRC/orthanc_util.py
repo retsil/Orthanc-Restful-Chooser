@@ -15,6 +15,8 @@
 
 import hashlib
 
+from pydicom.dataset import Dataset
+
 
 def _orthancHash(text: str) -> str:
     """Orthanc identifier: SHA-1 of text, formatted as 5 groups of 8 hex chars."""
@@ -97,3 +99,34 @@ INSTANCE_TAGS = [
     "ImageComments",
     "ImageOrientationPatient",
 ]
+
+
+# All main DICOM tags, in Patient -> Study -> Series -> Instance order.
+# ImageOrientationPatient is a main tag at both the series and instance level,
+# so the concatenation is de-duplicated while keeping that order.
+MAIN_TAGS = list(
+    dict.fromkeys(PATIENT_TAGS + STUDY_TAGS + SERIES_TAGS + INSTANCE_TAGS)
+)
+
+
+def instanceUUIDFor(ds: Dataset) -> str:
+    """Orthanc instance UUID derived from the dataset's DICOM identifiers."""
+    return instanceUUID(
+        str(ds.get("PatientID", "")),
+        str(ds.get("StudyInstanceUID", "")),
+        str(ds.get("SeriesInstanceUID", "")),
+        str(ds.get("SOPInstanceUID", "")),
+    )
+
+
+def extractMainTags(ds: Dataset) -> dict[str, object]:
+    """Pull the main DICOM tags present in ds into a {keyword: value} dict."""
+    tags: dict[str, object] = {}
+    for keyword in MAIN_TAGS:
+        if keyword not in ds:
+            continue
+        value = ds.get(keyword)
+        if value is None or str(value) == "":
+            continue
+        tags[keyword] = value
+    return tags
