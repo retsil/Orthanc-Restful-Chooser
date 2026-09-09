@@ -15,8 +15,10 @@
 
 """Search studies on an Orthanc server and pick a subset via a curses UI.
 
-All study main tags are loaded from Orthanc in a single bulk request, then
-filtered locally against the --search-* criteria. The matching studies are
+The --search-* criteria are sent to Orthanc as a /tools/find query and the
+returned main tags are then narrowed locally by the same criteria, so an
+archive larger than the server's find limit is still searched in full. The
+matching studies are
 shown in a curses list where each row can be checked/unchecked; the checked
 study UUIDs (Orthanc identifiers) are printed to stdout and, optionally,
 saved to a JSON file for use by a later step.
@@ -25,11 +27,14 @@ With --module the selection is also handed straight to an Application: an
 OrthancHost is built over the checked studies and the Application subclass
 found in that module is loaded, wired to the host and fed every instance of
 every selected study. Without it, the browser only selects.
+
+Only the terminal front end lives here: the study search, the selection file
+format and the Host that serves the selected studies are front end agnostic
+and live in OrthancRC.studies, OrthancRC.selection and OrthancRC.orthanc.
 """
 
 import argparse
 import curses
-import dataclasses
 import json
 import sys
 from pathlib import Path
@@ -39,22 +44,10 @@ from pyorthanc import Orthanc
 
 from ..base import Application, Host
 from ..loader import loadApplicationClass
-
-FIND_PAGE_SIZE = 1000
-
-
-@dataclasses.dataclass
-class StudyRecord:
-    uid: str  # Orthanc identifier (UUID) for the study
-    study_instance_uid: str
-    patient_id: str
-    patient_surname: str
-    patient_given_name: str
-    patient_name_display: str
-    dob: str  # DICOM DA, YYYYMMDD
-    study_date: str  # DICOM DA, YYYYMMDD
-    accession: str
-    description: str
+from ..orthanc.host import OrthancHost
+from ..selection import (add_search_arguments, build_criteria, load_selection,
+                         save_selection)
+from ..studies import StudyRecord, fetch_all_studies, format_date, matches
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -65,14 +58,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--orthanc-username", default=None)
     parser.add_argument("--orthanc-password", default=None)
 
-    parser.add_argument("--search-patient-id", default=None)
-    parser.add_argument("--search-patient-surname", default=None)
-    parser.add_argument("--search-patient-givenname", default=None)
-    parser.add_argument("--search-dob", default=None, help="YYYYMMDD or YYYY-MM-DD")
-    parser.add_argument("--search-study-after", default=None, help="YYYYMMDD or YYYY-MM-DD")
-    parser.add_argument("--search-study-before", default=None, help="YYYYMMDD or YYYY-MM-DD")
-    parser.add_argument("--search-accession", default=None)
-    parser.add_argument("--search-description", default=None)
+    add_search_arguments(parser)
 
     parser.add_argument(
         "--save-selection", metavar="PATH", default=None,
@@ -107,113 +93,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
 
     return parser.parse_args(argv)
-
-
-def normalize_date(value: Optional[str]) -> Optional[str]:
-    """Turn 'YYYY-MM-DD' or 'YYYYMMDD' into DICOM DA ('YYYYMMDD')."""
-    if value is None:
-        return None
-    digits = value.replace("-", "")
-    if len(digits) != 8 or not digits.isdigit():
-        raise ValueError(f"Invalid date {value!r}, expected YYYYMMDD or YYYY-MM-DD")
-    return digits
-
-
-def build_criteria(args: argparse.Namespace) -> Dict[str, Optional[str]]:
-    return {
-        "patient_id": args.search_patient_id,
-        "patient_surname": args.search_patient_surname,
-        "patient_givenname": args.search_patient_givenname,
-        "dob": normalize_date(args.search_dob),
-        "study_after": normalize_date(args.search_study_after),
-        "study_before": normalize_date(args.search_study_before),
-        "accession": args.search_accession,
-        "description": args.search_description,
-    }
-
-
-def split_patient_name(raw: str) -> (str, str):
-    """Split a DICOM PN value ('Surname^Given^Middle^Prefix^Suffix') in two."""
-    alphabetic_group = raw.split("=")[0]
-    components = alphabetic_group.split("^")
-    surname = components[0] if len(components) > 0 else ""
-    given = components[1] if len(components) > 1 else ""
-    return surname, given
-
-
-def fetch_all_studies(client: Orthanc) -> List[StudyRecord]:
-    """Bulk-load every study's main tags in as few requests as possible.
-
-    Uses the low-level /tools/find endpoint directly (via post_tools_find)
-    instead of pyorthanc's find_studies()/Study objects: those only carry
-    the Orthanc ID and would each lazily re-fetch their own main tags with a
-    separate request the first time an attribute is read.
-    """
-    records: List[StudyRecord] = []
-    since = 0
-    while True:
-        page = client.post_tools_find({
-            "Level": "Study",
-            "Query": {},
-            "Expand": True,
-            "Limit": FIND_PAGE_SIZE,
-            "Since": since,
-        })
-        if not page:
-            break
-
-        for entry in page:
-            main_tags = entry.get("MainDicomTags", {})
-            patient_tags = entry.get("PatientMainDicomTags", {})
-            surname, given = split_patient_name(patient_tags.get("PatientName", ""))
-            records.append(StudyRecord(
-                uid=entry["ID"],
-                study_instance_uid=main_tags.get("StudyInstanceUID", ""),
-                patient_id=patient_tags.get("PatientID", ""),
-                patient_surname=surname,
-                patient_given_name=given,
-                patient_name_display=patient_tags.get("PatientName", "").replace("^", " ").strip(),
-                dob=patient_tags.get("PatientBirthDate", ""),
-                study_date=main_tags.get("StudyDate", ""),
-                accession=main_tags.get("AccessionNumber", ""),
-                description=main_tags.get("StudyDescription", ""),
-            ))
-
-        if len(page) < FIND_PAGE_SIZE:
-            break
-        since += FIND_PAGE_SIZE
-
-    return records
-
-
-def _contains(haystack: str, needle: str) -> bool:
-    return needle.lower() in haystack.lower()
-
-
-def matches(record: StudyRecord, criteria: Dict[str, Optional[str]]) -> bool:
-    if criteria["patient_id"] and not _contains(record.patient_id, criteria["patient_id"]):
-        return False
-    if criteria["patient_surname"] and not _contains(record.patient_surname, criteria["patient_surname"]):
-        return False
-    if criteria["patient_givenname"] and not _contains(record.patient_given_name, criteria["patient_givenname"]):
-        return False
-    if criteria["dob"] and record.dob != criteria["dob"]:
-        return False
-    if criteria["study_after"] and (not record.study_date or record.study_date < criteria["study_after"]):
-        return False
-    if criteria["study_before"] and (not record.study_date or record.study_date > criteria["study_before"]):
-        return False
-    if criteria["accession"] and not _contains(record.accession, criteria["accession"]):
-        return False
-    if criteria["description"] and not _contains(record.description, criteria["description"]):
-        return False
-    return True
-
-
-def format_date(value: str) -> str:
-    if len(value) == 8:
-        return f"{value[0:4]}-{value[4:6]}-{value[6:8]}"
-    return value
 
 
 def run_curses_ui(stdscr, records: List[StudyRecord], preselected: Set[str]) -> Optional[Set[str]]:
@@ -305,15 +184,30 @@ def run_curses_ui(stdscr, records: List[StudyRecord], preselected: Set[str]) -> 
             return None
 
 
-def save_selection(path: str, criteria: Dict[str, Optional[str]], uids: Set[str]) -> None:
-    with open(path, "w") as f:
-        json.dump({"criteria": criteria, "study_uids": sorted(uids)}, f, indent=2)
+def host_from_browser(
+    client: Orthanc,
+    criteria: Optional[Dict[str, Optional[str]]] = None,
+    preselected: Optional[Set[str]] = None,
+    **kwargs,
+) -> Optional[OrthancHost]:
+    """Pick studies in the curses UI and build a Host over them.
 
+    Returns None if the user cancelled the picker. `criteria` has the shape
+    build_criteria() returns; None offers every study on the server. Any other
+    keyword goes to OrthancHost.
 
-def load_selection(path: str) -> (Dict[str, Optional[str]], Set[str]):
-    with open(path) as f:
-        data = json.load(f)
-    return data.get("criteria", {}), set(data.get("study_uids", []))
+    This is the whole browser as a single call, for a caller that wants a
+    ready-made Host rather than main()'s command line.
+    """
+    records = fetch_all_studies(client, criteria)
+    if criteria is not None:
+        records = [r for r in records if matches(r, criteria)]
+
+    selected = curses.wrapper(run_curses_ui, records, preselected or set())
+    if selected is None:
+        return None
+    # Keep the browser's row order rather than the set's arbitrary one.
+    return OrthancHost(client, [r.uid for r in records if r.uid in selected], **kwargs)
 
 
 def run_application(host: Host, application_class: type[Application]) -> int:
@@ -366,7 +260,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     try:
-        all_studies = fetch_all_studies(client)
+        all_studies = fetch_all_studies(client, criteria)
     except Exception as exc:  # noqa: BLE001 - surface any connection/HTTP error plainly
         print(f"error: could not load studies from Orthanc: {exc}", file=sys.stderr)
         return 1
@@ -403,11 +297,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if application_class is None:
         return 0
 
-    # Build the host over the selection directly rather than through
-    # OrthancHost.fromBrowser(), which would re-fetch the studies and show the
+    # Built over the selection directly rather than through
+    # host_from_browser(), which would re-fetch the studies and show the
     # picker a second time. Keep the browser's row order, not the set's.
-    from .host import OrthancHost  # deferred: host imports this module
-
     host = OrthancHost(
         client,
         [r.uid for r in records if r.uid in selected],

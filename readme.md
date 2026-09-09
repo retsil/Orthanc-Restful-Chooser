@@ -76,6 +76,79 @@ python3.13 -m OrthancRC.curses --module OrthancRC.examples.clone \
 The module is loaded before the search runs, so a bad `--module` fails
 immediately rather than after studies have been selected.
 
+Taking an instance's data starts the download of the next few on a small
+thread pool, so the following `getInputData()` usually only waits for a request
+that is already in flight. The window is `OrthancHost(..., prefetchDepth=2)`
+instances deep; `prefetchDepth=0` turns it off and fetches each instance at the
+moment it is asked for.
+
+Prefetching follows what the Application takes, not where `sendInputs()` has
+got to, so it costs nothing for an Application that filters on main tags and
+asks for few instances, and it works just as well for one that reads every main
+tag first and only asks for the data afterwards -- from the last input, or once
+the run is over. In that last case call `host.close()` when done, to stop the
+pool `sendInputs()` is no longer around to close.
+
+The Host itself is not part of the terminal front end: `OrthancHost` lives in
+`OrthancRC.orthanc` and knows only a list of study UUIDs, so anything can pick
+them. `OrthancHost.fromSelectionFile()` builds one from a saved selection, and
+`OrthancRC.curses.browser.host_from_browser()` is the whole picker as a single
+call for a caller that wants a ready-made Host rather than a command line.
+
+### Download example application
+
+An example Application with its own command line. It takes a study selection
+saved earlier by the browser, watches the main tags the host offers for each
+instance, and downloads only the series matching every criterion given:
+`--match-modality` (exact, case-insensitive), `--match-series-description`
+(substring, case-insensitive) and `--match-series-instance-uid` (exact). A
+criterion left unset matches every series, so with none of them the whole
+selection is downloaded into `--target-folder`:
+
+```
+python3.13 -m OrthancRC.examples.download \
+    --from-selection-file selection.json \
+    --match-modality CT --match-series-description head \
+    --target-folder ./series
+```
+
+`--match-series-instance-uid` picks out one known series by its
+SeriesInstanceUID, rather than describing it:
+
+```
+python3.13 -m OrthancRC.examples.download \
+    --from-selection-file selection.json \
+    --match-series-instance-uid 1.2.840.113619.2.55.3.604688.1 \
+    --target-folder ./series
+```
+
+The instances of the matching series are written straight into the target
+folder as `<SOPInstanceUID>.dcm`. If more than one series matches, the second
+goes to `<target-folder>-1`, the third to `<target-folder>-2`, and so on, in
+the order the series are first seen -- which from `OrthancHost` is SeriesNumber
+order, so the same selection always lands in the same folders. Instances of non-matching series are
+filtered on their main tags alone, so they are never pulled from Orthanc.
+
+While it works, the download reports how far it has got on standard error, as
+a percentage and a bar over the instances the host has to offer:
+
+```
+[############------------------]  42% (42/100)
+```
+
+On a terminal that one line is rewritten in place; when standard error is
+redirected it is printed whole every 10% instead, so a captured run stays
+readable. Progress counts every instance offered, matching or not, since that
+is the work the run has to get through; `--no-progress` turns it off. A host
+that does not say how large the selection is leaves nothing to take a
+percentage of, and the download then simply reports no progress.
+
+It reuses `OrthancHost` (through `OrthancHost.fromSelectionFile`) and adds
+only its own `Application`; that Application can equally be driven from the
+browser with
+`--module OrthancRC.examples.download`, which then downloads every selected
+instance into the host's temporary directory.
+
 ### Testing
 
 ```

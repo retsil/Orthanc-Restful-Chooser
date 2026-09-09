@@ -34,6 +34,8 @@ orthanc = ["pyorthanc>=1.20"]
 orthancrc-cmdline = "OrthancRC.cmdline.filelist:main"
 # Needs the "orthanc" extra.
 orthancrc-browser = "OrthancRC.curses.browser:main"
+# Example Application with its own command line; needs the "orthanc" extra.
+orthancrc-download = "OrthancRC.examples.download.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/retsil/"
@@ -45,3 +47,4 @@ where = ["src"]
 # wheel; see __icon__ in each example.
 [tool.setuptools.package-data]
 "OrthancRC.examples.clone" = ["*.png"]
+"OrthancRC.examples.download" = ["*.png"]
