@@ -21,9 +21,10 @@ that has already made the connection.
 """
 
 from .application import DownloadSeries
-from .progress import ProgressBar
+from .progress import ProgressBar, Rate
 
 __all__ = [
     "DownloadSeries",
     "ProgressBar",
+    "Rate",
 ]

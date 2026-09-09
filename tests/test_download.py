@@ -26,7 +26,7 @@ from pydicom.dataset import Dataset
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from OrthancRC.enums import State  # noqa: E402
-from OrthancRC.examples.download import DownloadSeries, ProgressBar  # noqa: E402
+from OrthancRC.examples.download import DownloadSeries, ProgressBar, Rate  # noqa: E402
 from OrthancRC.orthanc_util import extractMainTags, instanceUUIDFor  # noqa: E402
 
 DATA_FILE = Path(__file__).resolve().parent / "CT_small.dcm"
@@ -59,6 +59,19 @@ class FakeHost:
 
     def notifyStatus(self, value, text: str) -> None:
         self.messages.append((value, text))
+
+
+class FakeClock:
+    """A monotonic clock a test moves on itself, instead of waiting."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def tick(self, seconds: float) -> None:
+        self.now += seconds
 
 
 def _tags(ds: Dataset, **overrides) -> dict:
@@ -368,6 +381,119 @@ class TestDownloadProgress(unittest.TestCase):
         self.assertIsNone(app.progress)
         app.notifyInputAvailable(uuid, _tags(ds), lastData=True)
         self.assertTrue((Path(tmp.name) / "out" / f"{ds.SOPInstanceUID}.dcm").is_file())
+
+
+class TestDownloadRate(unittest.TestCase):
+    """The bytes-per-second the download reports beside its progress."""
+
+    def _rate(self) -> tuple:
+        clock = FakeClock()
+        return Rate(clock=clock), clock
+
+    def test_rate_is_the_bytes_over_the_seconds_they_took(self):
+        rate, clock = self._rate()
+        rate.add(2048)
+        clock.tick(2.0)
+        self.assertEqual(rate.bytes, 2048)
+        self.assertEqual(rate.elapsed, 2.0)
+        self.assertEqual(rate.bytesPerSecond, 1024.0)
+
+    def test_rate_averages_over_the_whole_run(self):
+        rate, clock = self._rate()
+        # A fast first second and an idle second average out to half the speed.
+        rate.add(1024)
+        clock.tick(1.0)
+        self.assertEqual(rate.bytesPerSecond, 1024.0)
+        clock.tick(1.0)
+        self.assertEqual(rate.bytesPerSecond, 512.0)
+
+    def test_no_elapsed_time_has_no_rate_to_report(self):
+        rate, _ = self._rate()
+        rate.add(1024)
+        # Dividing by no time at all would be a rate of infinity, not of zero.
+        self.assertIsNone(rate.bytesPerSecond)
+        self.assertEqual(rate.format(), "")
+
+    def test_a_run_that_downloaded_nothing_reports_zero(self):
+        rate, clock = self._rate()
+        clock.tick(4.0)
+        self.assertEqual(rate.bytesPerSecond, 0.0)
+        self.assertEqual(rate.format(), "0 B/s")
+
+    def test_the_unit_follows_the_size_of_the_rate(self):
+        for byteCount, expected in (
+            (512, "512 B/s"),
+            (1024, "1.0 KiB/s"),
+            (1536, "1.5 KiB/s"),
+            (5 * 1024 ** 2, "5.0 MiB/s"),
+            (3 * 1024 ** 3, "3.0 GiB/s"),
+        ):
+            rate, clock = self._rate()
+            rate.add(byteCount)
+            clock.tick(1.0)
+            self.assertEqual(rate.format(), expected)
+
+    def test_the_bar_shows_the_rate_beside_the_count(self):
+        clock = FakeClock()
+        rate = Rate(clock=clock)
+        stream = io.StringIO()
+        bar = ProgressBar(2, stream=stream, isTTY=True, rate=rate)
+
+        rate.add(2 * 1024 ** 2)
+        clock.tick(2.0)
+        bar.advance()
+        self.assertIn("50% (1/2)  1.0 MiB/s", stream.getvalue())
+
+    def test_a_bar_without_a_rate_is_unchanged(self):
+        stream = io.StringIO()
+        bar = ProgressBar(2, stream=stream, isTTY=True)
+        bar.advance()
+        self.assertTrue(stream.getvalue().endswith("50% (1/2)"))
+
+    def test_the_application_counts_the_bytes_it_wrote(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ds = pydicom.dcmread(str(DATA_FILE))
+        uuid = instanceUUIDFor(ds)
+        host = FakeHost({uuid: ds}, Path(tmp.name) / "tmp")
+
+        app = DownloadSeries(host, targetFolder=Path(tmp.name) / "out",
+                             showProgress=False)
+        with contextlib.redirect_stderr(io.StringIO()):
+            app.notifyInputAvailable(uuid, _tags(ds), lastData=True)
+
+        written = Path(tmp.name) / "out" / f"{ds.SOPInstanceUID}.dcm"
+        self.assertEqual(app.rate.bytes, written.stat().st_size)
+
+    def test_a_skipped_instance_adds_no_bytes(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ds = pydicom.dcmread(str(DATA_FILE))
+        uuid = instanceUUIDFor(ds)
+        host = FakeHost({uuid: ds}, Path(tmp.name) / "tmp")
+
+        app = DownloadSeries(host, matchModality="XX",
+                             targetFolder=Path(tmp.name) / "out",
+                             showProgress=False)
+        with contextlib.redirect_stderr(io.StringIO()):
+            app.notifyInputAvailable(uuid, _tags(ds), lastData=True)
+
+        self.assertEqual(app.rate.bytes, 0)
+
+    def test_the_closing_summary_reports_the_rate(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ds = pydicom.dcmread(str(DATA_FILE))
+        uuid = instanceUUIDFor(ds)
+        host = FakeHost({uuid: ds}, Path(tmp.name) / "tmp")
+
+        # --no-progress draws no bar, but the run still knows how fast it went.
+        app = DownloadSeries(host, targetFolder=Path(tmp.name) / "out",
+                             showProgress=False)
+        with contextlib.redirect_stderr(io.StringIO()):
+            app.notifyInputAvailable(uuid, _tags(ds), lastData=True)
+
+        self.assertRegex(host.messages[-1][1], r", at \d+(\.\d+)? [KMG]?i?B/s$")
 
 
 class TestDownloadCli(unittest.TestCase):

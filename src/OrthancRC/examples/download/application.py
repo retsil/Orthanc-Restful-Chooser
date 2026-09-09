@@ -28,7 +28,7 @@ from pydicom.dataset import Dataset
 
 from ...base import Application, Host
 from ...enums import State, Status
-from .progress import ProgressBar
+from .progress import ProgressBar, Rate
 
 _MODULE_DIR = Path(__file__).resolve().parent
 
@@ -82,10 +82,15 @@ class DownloadSeries(Application):
             Path(targetFolder) if targetFolder is not None
             else self._host.getTmpDir() / "download"
         )
+        # The rate is kept whether or not there is a bar to draw it on, so
+        # that the closing summary can report one even with --no-progress.
+        self._rate = Rate()
         # Progress counts every instance offered, matching or not: it tracks
-        # the way through the selection, not the number of files written.
+        # the way through the selection, not the number of files written; the
+        # rate beside it counts only the bytes that actually arrived.
         self._progress: Optional[ProgressBar] = (
-            ProgressBar(countInputs(host)) if showProgress else None
+            ProgressBar(countInputs(host), rate=self._rate) if showProgress
+            else None
         )
         self._downloaded = 0
         self._skipped = 0
@@ -103,6 +108,11 @@ class DownloadSeries(Application):
     def progress(self) -> Optional[ProgressBar]:
         """The bar reporting how far through the selection this run is."""
         return self._progress
+
+    @property
+    def rate(self) -> Rate:
+        """The rate at which downloaded bytes have been arriving."""
+        return self._rate
 
     @property
     def seriesFolders(self) -> dict[str, Path]:
@@ -152,11 +162,13 @@ class DownloadSeries(Application):
                 self._progress.finish()
 
         if lastData:
+            rate = self._rate.format()
             self._host.notifyStatus(
                 Status.INFORMATION,
                 f"downloaded {self._downloaded} instance(s) in "
                 f"{len(self._seriesFolders)} series into {self._targetFolder}, "
-                f"skipped {self._skipped}, failed {self._failed}",
+                f"skipped {self._skipped}, failed {self._failed}"
+                + (f", at {rate}" if rate else ""),
             )
             self._host.notifyStateChanged(State.COMPLETED)
         return True
@@ -193,6 +205,14 @@ class DownloadSeries(Application):
             return
 
         self._downloaded += 1
+        # What landed on disk is what came over the wire, and the file is the
+        # one thing that can be measured without holding the bytes twice.
+        try:
+            self._rate.add(path.stat().st_size)
+        except OSError:
+            # A written file that cannot be stat'ed only costs the rate some
+            # accuracy; it is not worth failing a download that succeeded.
+            pass
         self._host.notifyStatus(Status.INFORMATION, f"wrote {path}")
 
     def _seriesFolder(self, instanceUUID: str, mainTags: dict[str, object]) -> Path:
