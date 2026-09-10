@@ -78,6 +78,25 @@ cd src
 python3.13 -m OrthancRC.cmdline --input ../tests/CT_small.dcm --module OrthancRC.examples.clone
 ```
 
+The Host and the Application are two objects in that one Python process,
+calling each other's methods directly. Only the Host touches the filesystem:
+
+```mermaid
+flowchart LR
+    subgraph proc["one python process"]
+        direction LR
+        H["Host<br/><small>OrthancRC.cmdline</small>"]
+        A["Application<br/><small>OrthancRC.examples.clone</small>"]
+        H -- "notifyInputAvailable()" --> A
+        A -- "getInputData()" --> H
+        A -- "notifyOutputAvailable()" --> H
+        H -- "getOutputData()" --> A
+    end
+    FS[("filesystem")]
+    FS -- "read CT_small.dcm" --> H
+    H -- "write &lt;UUID&gt;.dcm" --> FS
+```
+
 ## Orthanc study browser
 
 Search an Orthanc server and pick studies in a curses list. Without `--module`
@@ -113,9 +132,9 @@ the Application never learns where its data came from.
 ```mermaid
 sequenceDiagram
     actor User
-    participant B as curses browser
-    participant H as OrthancHost
-    participant A as CloneInstances
+    participant B as Browser (OrthancRC.curses)
+    participant H as Host (OrthancRC.othanc)
+    participant A as Application (OrthancRC.examples.clone)
     participant O as Orthanc server
 
     B->>O: POST /tools/find (Level: Study)
