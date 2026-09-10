@@ -7,6 +7,53 @@ https://dicom.nema.org/Dicom/2011/11_19pu.pdf. The standard defines Application
 and Host communication through SOAP calls, but that is overkill for most
 implementations because everything is Python.
 
+## Installing
+
+The project is a standard `src`-layout package built with setuptools. From the
+root of a checkout:
+
+```
+python3 -m pip install -e .
+```
+
+That installs the framework and its only hard requirement, `pydicom`, which is
+enough to write and test an Application against a host you supply yourself.
+
+The Orthanc-backed host, the curses study browser and the example Applications
+need `pyorthanc` as well, which lives behind the `orthanc` extra:
+
+```
+python3 -m pip install -e '.[orthanc]'
+```
+
+`-e` installs in editable mode, so edits under `src/OrthancRC` take effect
+without reinstalling; drop it for an ordinary install. To build a wheel and
+source distribution instead, use `python3 -m build`.
+
+Installing puts three commands on the path:
+
+| Command | Module | Extra |
+| --- | --- | --- |
+| `orthancrc-cmdline` | `OrthancRC.cmdline.filelist` | none |
+| `orthancrc-browser` | `OrthancRC.curses.browser` | `orthanc` |
+| `orthancrc-download` | `OrthancRC.examples.download.cli` | `orthanc` |
+
+### Requirements
+
+Requirements are declared in `pyproject.toml`, which is the one place to change
+them:
+
+- `[project] requires-python` is the minimum interpreter, currently 3.10.
+- `[project] dependencies` holds the hard requirements: `pydicom>=3.0`.
+- `[project.optional-dependencies]` holds the extras: `orthanc` pulls in
+  `pyorthanc>=1.20`.
+- `[build-system] requires` holds build-time tools, which are installed by pip
+  during the build and are not runtime requirements.
+
+A `requirements.txt` is provided for the `pip install -r` workflow and a
+`setup.py` shim for tools that still invoke it, but neither carries any
+metadata of its own; both defer to `pyproject.toml`.
+
 ## Python modules
 
 This implementation expects that the end user starts the Python host process.
@@ -360,6 +407,10 @@ instance into the host's temporary directory.
 
 ## Testing
 
+The tests exercise the Orthanc host and the example Applications, so they need
+the `orthanc` extra installed (see [Installing](#installing)):
+
 ```
+python3 -m pip install -e '.[orthanc]'
 python3.13 -m unittest discover -s tests -t tests
 ```
