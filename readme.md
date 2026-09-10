@@ -76,6 +76,126 @@ python3.13 -m OrthancRC.curses --module OrthancRC.examples.clone \
 The module is loaded before the search runs, so a bad `--module` fails
 immediately rather than after studies have been selected.
 
+#### Picking series
+
+`s` opens a second picker over every study that is checked -- not the study
+under the cursor -- listing all their series as one list so that a study can
+be narrowed to some of them. It is the same idiom as the study list, so the
+code and the muscle memory carry over: up/down, PgUp/PgDn, SPACE to toggle,
+`a` and `n` over everything at once. The rows are grouped under a heading per
+study for reading, but there is one cursor through the whole thing and the
+series are in the order the host will offer their instances in.
+
+ENTER means the same thing on both screens: it keeps the sub-selection and
+confirms the browse, so narrowing the last study finishes rather than handing
+back the study list to press ENTER on again. The two pickers differ in one
+thing, and the footer says so: `q`/ESC discards the sub-selection and goes
+back to the study list with the previous series intact. That abandons the
+sub-selection, not the whole browse.
+
+Everything is checked when the picker opens over a study that has no
+sub-selection yet, because the whole study is what it currently means. A study
+left with no series at all is un-checked in the study list instead -- no series
+is no study -- and a study that only some series are taken from shows `[~]`
+rather than `[x]`. Nothing else about the study list changes, and a run that
+never presses `s` behaves exactly as it did before the key existed.
+
+Listing series is one request per study, so `s` over a hundred checked studies
+costs a hundred of them and says so while it waits; what it fetches is kept
+for the session, so re-opening the picker is instant.
+
+#### The selection file
+
+`--save-selection` grows two optional keys, and a file written before they
+existed still loads and still means what it always meant:
+
+```json
+{
+  "criteria": { "...": null },
+  "selection_level": "series",
+  "study_uids": ["<study UUID>"],
+  "series_uids": { "<study UUID>": ["<series UUID>"] }
+}
+```
+
+A study missing from `series_uids` means the whole study -- whatever it holds
+when the file is read -- and `selection_level` is the file saying which of the
+two it is, so no reader has to guess from whether `series_uids` happens to be
+there. A study the picker was opened over keeps its explicit series list even
+when every series is checked: absent and complete-list are different
+statements, and only the second records what was actually on the screen.
+
+Both are Orthanc identifiers rather than DICOM UIDs, as `study_uids` already
+was. That costs nothing in portability: an Orthanc identifier is a SHA-1 of
+`patientID|studyUID|seriesUID`, which is Orthanc's own scheme, so the same
+series has the same identifier on every Orthanc that holds it. What is lost is
+that the hash is one-way -- the file cannot be read by eye or resolved by a
+non-Orthanc system -- and that is the right price for a file whose reason to
+exist is passing a selection between two processes looking at the same server.
+
+`--restore-selection` is strict about all of it, and stays strict: a saved
+study that no longer matches the criteria, or a saved series its study no
+longer holds, is a message on standard error and a non-zero exit. There is no
+partial restore and no prompt, because the file is the message of the simplest
+IPC there is: a silently degraded selection is a corrupted one, and the sender
+would never find out that half of it was dropped. Note that pinning full
+series lists makes this bite more often -- any study the picker was opened over
+now fails its restore if the archive has since lost one of its series -- which
+is the strictness working as intended rather than a regression.
+
+`OrthancHost.fromSelectionFile()` needs no study-versus-series argument for
+the same reason: the file says. The download example works unchanged against a
+file of either kind.
+
+#### Reviewing output before it is written: `--stage`
+
+`--stage` holds the Application's output back until a table of the output
+series it produced has been confirmed:
+
+```
+python3.13 -m OrthancRC.curses --module OrthancRC.examples.clone \
+    --stage --output-dir ./out
+```
+
+The table is one row per output series with a count of the output instances in
+it -- which is not the size of the input series, since an Application may emit
+one output per input, or fewer, or more -- and every row starts accepted. So
+`--stage` is a review step rather than an opt-in: confirming the table
+untouched does exactly what the same run without `--stage` would have done,
+and rejecting is the action. There is no cancel on that screen, because the
+run is already over and there would be nothing to cancel to; the ways out are
+ENTER and an explicit `n`. A series that is rejected is never written and
+never uploaded, and `getOutputData()` is never called for it.
+
+The Application sees no change at all. Its `getOutputData()` is called once,
+synchronously, from inside its own `notifyOutputAvailable()`, exactly where it
+is called without `--stage`, so an Application that builds its output on
+demand and frees it when the call returns works staged too. That is deliberate
+rather than incidental: this interface has no `releaseData()`, so nothing
+would tell an Application when it may free an output the Host asked it to
+keep, and a Host that deferred the call until after the run would be asking
+for data every reasonable Application has already dropped. The Host therefore
+takes the output while the call is in its hands and takes responsibility for
+it afterwards.
+
+Which means holding it. Encoded output is kept in memory up to
+`--output-cache` (a byte count with an optional `K`/`M`/`G` suffix, default
+`128M`) and written to a spill file in the host's temporary directory past
+that, deleted at the end of the review whether its series was accepted or
+rejected. 128 MB is roughly 250 512x512 16-bit CT slices, two or three typical
+series; a large single frame -- mammography, whole-slide -- spills almost at
+once, which is the right outcome for output that should not be accumulating in
+a Python process. `--output-cache 0` spills everything. What was held and what
+was spilled is reported at the end of a run, since that is the only way to
+find out the number was too low for the work. It is a ceiling on output held,
+on top of the `prefetchDepth` decoded input datasets the prefetch window may
+hold.
+
+None of that lives in the terminal front end. `StagingHost` wraps an
+`OrthancHost` and intercepts exactly one call, forwarding everything else, so
+it has one tmp dir and one message list between the two; `curses` contributes
+the y/n screen and nothing more.
+
 Taking an instance's data starts the download of the next few on a small
 thread pool, so the following `getInputData()` usually only waits for a request
 that is already in flight. The window is `OrthancHost(..., prefetchDepth=2)`
@@ -96,8 +216,8 @@ the run is over. In that last case call `host.close()` when done, to stop the
 pool `sendInputs()` is no longer around to close.
 
 The Host itself is not part of the terminal front end: `OrthancHost` lives in
-`OrthancRC.orthanc` and knows only a list of study UUIDs, so anything can pick
-them. `OrthancHost.fromSelectionFile()` builds one from a saved selection, and
+`OrthancRC.orthanc` and knows only a list of study UUIDs -- and, optionally,
+which series to take from each -- so anything can pick them. `OrthancHost.fromSelectionFile()` builds one from a saved selection, and
 `OrthancRC.curses.browser.host_from_browser()` is the whole picker as a single
 call for a caller that wants a ready-made Host rather than a command line.
 

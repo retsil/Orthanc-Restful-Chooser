@@ -60,6 +60,16 @@ class Application(ABC):
 
     @abstractmethod
     def getOutputData(self, instanceUUID: str) -> Dataset:
+        """The output the Application announced with notifyOutputAvailable().
+
+        The Host calls this from inside that notification and never after it
+        returns, so an Application is free to build its output on demand and
+        drop it as soon as the call is over. This interface has no
+        releaseData() to say otherwise -- PS3.19 gets that answer from the
+        transition to IDLE, and there is no such transition here -- so a Host
+        that wants to hold output back keeps it itself rather than asking
+        again later.
+        """
         ...
 
     @abstractmethod

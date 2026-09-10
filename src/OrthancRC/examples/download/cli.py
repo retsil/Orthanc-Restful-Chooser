@@ -21,7 +21,6 @@ serve them, so the only thing this example adds is its own Application.
 """
 
 import argparse
-import json
 import sys
 from pathlib import Path
 from typing import List, Optional
@@ -91,7 +90,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         host = OrthancHost.fromSelectionFile(
             client, args.from_selection_file, uploadOutputs=False,
         )
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
+        # ValueError rather than JSONDecodeError alone: a file that parses but
+        # does not describe a selection -- a level disagreeing with the series
+        # beside it, say -- is refused the same way, and JSONDecodeError is a
+        # ValueError already.
         print(f"error: could not read --from-selection-file: {exc}", file=sys.stderr)
         return 1
 

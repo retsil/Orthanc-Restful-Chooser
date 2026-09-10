@@ -40,6 +40,20 @@ def instanceUUID(patientID: str, studyUID: str, seriesUID: str, sopInstanceUID: 
     return _orthancHash(f"{patientID}|{studyUID}|{seriesUID}|{sopInstanceUID}")
 
 
+def asNumber(value: object) -> tuple:
+    """An IS tag as a sortable number; anything unusable sorts last.
+
+    These arrive as strings, so comparing them as written would put "10"
+    before "2". A missing or malformed number cannot be guessed at, and
+    pretending it is 0 would push those values in front of the numbered ones
+    instead of after them.
+    """
+    try:
+        return (0, int(str(value).strip()))
+    except (TypeError, ValueError):
+        return (1, 0)
+
+
 PATIENT_TAGS = [
     "PatientName",
     "PatientID",

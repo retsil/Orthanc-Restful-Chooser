@@ -14,7 +14,9 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import io
+import json
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -505,6 +507,190 @@ class ExpandTest(unittest.TestCase):
         # Only the bare UUID costs a request; a full record is passed through.
         self.assertEqual(fetched, ["x"])
         self.assertEqual([e["ID"] for e in entries], ["x", "y"])
+
+
+class SeriesSelectionTest(unittest.TestCase):
+    """A study may be narrowed to some of its series, by Orthanc identifier."""
+
+    STUDY = _study(
+        [_series("sA", "1"), _series("sB", "2")],
+        [_instance("a1", "sA", "1"), _instance("a2", "sA", "2"),
+         _instance("b1", "sB", "1")],
+    )
+
+    def _host(self, seriesUUIDs=None) -> OrthancHost:
+        return OrthancHost(FakeOrthanc({"st1": self.STUDY}), ["st1"],
+                           seriesUUIDs=seriesUUIDs)
+
+    def test_a_study_nobody_narrowed_is_served_whole(self):
+        self.assertEqual(self._host().instanceUUIDs, ["a1", "a2", "b1"])
+        self.assertEqual(self._host({}).instanceUUIDs, ["a1", "a2", "b1"])
+
+    def test_only_the_selected_series_instances_are_offered(self):
+        host = self._host({"st1": ["sB"]})
+        self.assertEqual(host.instanceUUIDs, ["b1"])
+
+    def test_a_filtered_instance_does_not_exist_as_far_as_the_host_knows(self):
+        """Filtered in _loadInstances, not in sendInputs: the rest of the Host
+        must never see an instance the selection excluded."""
+        host = self._host({"st1": ["sB"]})
+
+        self.assertEqual(host.getMainTags("a1"), {})
+        self.assertEqual(host.getInputData("a1"), pydicom.Dataset())
+        self.assertIn("not a selected instance", host.messages[-1][1])
+
+    def test_ordering_survives_the_filter(self):
+        host = self._host({"st1": ["sA", "sB"]})
+        self.assertEqual(host.instanceUUIDs, ["a1", "a2", "b1"])
+
+    def test_narrowing_one_study_leaves_another_whole(self):
+        client = FakeOrthanc({
+            "st1": self.STUDY,
+            "st2": _study([_series("sC", "1")], [_instance("c1", "sC", "1")]),
+        })
+        host = OrthancHost(client, ["st1", "st2"], seriesUUIDs={"st1": ["sB"]})
+
+        self.assertEqual(host.instanceUUIDs, ["b1", "c1"])
+
+    def test_a_series_the_study_no_longer_holds_is_reported_and_carried_past(self):
+        host = self._host({"st1": ["sB", "gone"]})
+
+        # The same treatment a study that cannot be read gets: report, and go
+        # on with what is there. A front end restoring a selection is stricter.
+        self.assertEqual(host.instanceUUIDs, ["b1"])
+        self.assertEqual(host.messages[0][0], Status.ERROR)
+        self.assertIn("no longer has selected series", host.messages[0][1])
+        self.assertIn("gone", host.messages[0][1])
+
+    def test_the_selection_is_reported_back_sorted(self):
+        host = self._host({"st1": ["sB", "sA"]})
+        self.assertEqual(host.seriesUUIDs, {"st1": ["sA", "sB"]})
+
+    def test_a_selection_of_no_series_at_all_is_an_empty_run(self):
+        # Not the same as the study being absent: it is a study narrowed to
+        # nothing, and the run has no instances.
+        host = self._host({"st1": []})
+        host.setApplication(SendInputsTest.RecordingApp())
+
+        self.assertFalse(host.sendInputs())
+        self.assertIn("no instances", host.messages[-1][1])
+
+
+class FromSelectionFileTest(unittest.TestCase):
+    """The file says which level it is, so there is no mode argument."""
+
+    def _write(self, folder, **keys) -> str:
+        path = Path(folder) / "selection.json"
+        path.write_text(json.dumps({"criteria": {}, **keys}))
+        return str(path)
+
+    def test_a_study_level_file_serves_whole_studies(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self._write(folder, study_uids=["st1"])
+            host = OrthancHost.fromSelectionFile(
+                FakeOrthanc({"st1": SeriesSelectionTest.STUDY}), path)
+
+        self.assertEqual(host.studyUUIDs, ["st1"])
+        self.assertEqual(host.seriesUUIDs, {})
+        self.assertEqual(host.instanceUUIDs, ["a1", "a2", "b1"])
+
+    def test_a_series_level_file_serves_the_series_it_names(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self._write(folder, selection_level="series",
+                               study_uids=["st1"], series_uids={"st1": ["sB"]})
+            host = OrthancHost.fromSelectionFile(
+                FakeOrthanc({"st1": SeriesSelectionTest.STUDY}), path)
+
+        self.assertEqual(host.instanceUUIDs, ["b1"])
+
+    def test_a_file_that_contradicts_itself_builds_no_host(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self._write(folder, selection_level="study",
+                               study_uids=["st1"], series_uids={"st1": ["sB"]})
+            with self.assertRaises(ValueError):
+                OrthancHost.fromSelectionFile(FakeOrthanc({}), path)
+
+    def test_other_keywords_still_reach_the_constructor(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self._write(folder, study_uids=["st1"])
+            host = OrthancHost.fromSelectionFile(
+                FakeOrthanc({"st1": SeriesSelectionTest.STUDY}), path,
+                uploadOutputs=False, prefetchDepth=0)
+
+        self.assertFalse(host._uploadOutputs)
+
+
+class OutputTest(unittest.TestCase):
+    """notifyOutputAvailable is a get-and-encode and a store, separably."""
+
+    class OutputApp:
+        def __init__(self, ds=None, asked=None) -> None:
+            self.ds = ds if ds is not None else pydicom.dcmread(str(DATA_FILE))
+            self.asked = asked if asked is not None else []
+
+        def getOutputData(self, instanceUUID):
+            self.asked.append(instanceUUID)
+            return self.ds
+
+    def _host(self, folder, **kwargs) -> OrthancHost:
+        return OrthancHost(FakeOrthanc({}), [],
+                           outputDir=Path(folder) / "out", **kwargs)
+
+    def test_an_output_is_written_and_uploaded_as_it_always_was(self):
+        with tempfile.TemporaryDirectory() as folder:
+            host = self._host(folder)
+            host._client.post_instances = lambda data: {"ID": "stored"}
+            app = self.OutputApp()
+            host.setApplication(app)
+
+            self.assertTrue(host.notifyOutputAvailable("i1", {}, True))
+
+            written = Path(folder) / "out" / "i1.dcm"
+            self.assertTrue(written.exists())
+        self.assertEqual(app.asked, ["i1"])
+
+    def test_store_output_writes_bytes_without_asking_the_application(self):
+        with tempfile.TemporaryDirectory() as folder:
+            host = self._host(folder, uploadOutputs=False)
+            app = self.OutputApp()
+            host.setApplication(app)
+
+            self.assertTrue(host.storeOutput("i1", b"already encoded"))
+
+            written = Path(folder) / "out" / "i1.dcm"
+            self.assertEqual(written.read_bytes(), b"already encoded")
+        # The seam exists so that staged output can be stored long after the
+        # Application let go of it.
+        self.assertEqual(app.asked, [])
+
+    def test_an_unencodable_dataset_is_reported_by_the_call_that_made_it(self):
+        with tempfile.TemporaryDirectory() as folder:
+            host = self._host(folder, uploadOutputs=False)
+            host.setApplication(self.OutputApp(ds=pydicom.Dataset()))
+
+            self.assertFalse(host.notifyOutputAvailable("i1", {}, True))
+
+        self.assertEqual(host.messages[-1][0], Status.ERROR)
+        self.assertIn("could not encode output", host.messages[-1][1])
+
+    def test_encode_output_hands_back_the_bytes_both_sinks_take(self):
+        host = OrthancHost(FakeOrthanc({}), [])
+        data = host.encodeOutput(pydicom.dcmread(str(DATA_FILE)), "i1")
+
+        self.assertIsInstance(data, bytes)
+        self.assertEqual(
+            pydicom.dcmread(io.BytesIO(data)).PatientID,
+            pydicom.dcmread(str(DATA_FILE)).PatientID)
+
+    def test_a_failed_upload_is_a_failed_store(self):
+        def boom(_data):
+            raise RuntimeError("no server")
+
+        host = OrthancHost(FakeOrthanc({}), [])
+        host._client.post_instances = boom
+
+        self.assertFalse(host.storeOutput("i1", b"x"))
+        self.assertIn("could not upload output", host.messages[-1][1])
 
 
 if __name__ == "__main__":

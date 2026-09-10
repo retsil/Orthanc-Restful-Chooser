@@ -21,7 +21,14 @@ them and hands it the Application to feed.
 """
 
 from .host import OrthancHost
+from .staging import (DEFAULT_OUTPUT_CACHE_BYTES, StagedSeries, StagingHost,
+                      formatByteSize, parseByteSize)
 
 __all__ = [
+    "DEFAULT_OUTPUT_CACHE_BYTES",
     "OrthancHost",
+    "StagedSeries",
+    "StagingHost",
+    "formatByteSize",
+    "parseByteSize",
 ]

@@ -18,7 +18,9 @@
 The studies to work on are chosen elsewhere: a front end builds a Host over
 the Orthanc identifiers it picked, or over a selection written earlier with a
 browser's --save-selection (`fromSelectionFile`). Nothing here knows how they
-were picked, so no user interface is involved.
+were picked, so no user interface is involved. A study may be narrowed to some
+of its series, again by Orthanc identifier; a study nobody narrowed is served
+whole.
 
 Selected studies are expanded into their instances; each instance keeps its
 Orthanc identifier as its native object UUID and its main tags are collected
@@ -37,7 +39,7 @@ import sys
 import tempfile
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Set
 
 import pydicom
 from pydicom.dataset import Dataset
@@ -46,6 +48,7 @@ from pyorthanc import Orthanc
 
 from ..base import Application, Host
 from ..enums import State, Status
+from ..orthanc_util import asNumber
 from ..selection import load_selection
 
 
@@ -56,6 +59,7 @@ class OrthancHost(Host):
         self,
         client: Orthanc,
         studyUUIDs: Iterable[str],
+        seriesUUIDs: Optional[Dict[str, Iterable[str]]] = None,
         outputDir: Optional[Path] = None,
         tmpDir: Optional[Path] = None,
         uploadOutputs: bool = True,
@@ -63,6 +67,13 @@ class OrthancHost(Host):
     ) -> None:
         self._client = client
         self._studyUUIDs = list(studyUUIDs)
+        # {study UUID: the series wanted from it}. A study missing from this
+        # is served whole, which is what every study is without the argument,
+        # so the same rule covers both a selection file that carries no series
+        # and a caller that never mentions them.
+        self._seriesUUIDs: Dict[str, Set[str]] = {
+            study: set(wanted) for study, wanted in (seriesUUIDs or {}).items()
+        }
         self._outputDir = outputDir
         if self._outputDir is not None:
             self._outputDir.mkdir(parents=True, exist_ok=True)
@@ -96,9 +107,18 @@ class OrthancHost(Host):
 
     @classmethod
     def fromSelectionFile(cls, client: Orthanc, path: str, **kwargs) -> "OrthancHost":
-        """Build a Host from a browser --save-selection JSON file."""
-        _criteria, studyUUIDs = load_selection(path)
-        return cls(client, sorted(studyUUIDs), **kwargs)
+        """Build a Host from a browser --save-selection JSON file.
+
+        There is no study-versus-series argument because the file says which
+        it is: one written over a series sub-selection carries the series, one
+        written without carries none and means whole studies. A caller that
+        wants the whole studies out of a series-level file is asking a
+        different question, and passes `load_selection(path).study_uids` to
+        the constructor itself rather than reaching for a flag here.
+        """
+        selection = load_selection(path)
+        return cls(client, sorted(selection.study_uids),
+                   seriesUUIDs=selection.series_uids, **kwargs)
 
     # -- selected instances ----------------------------------------------
 
@@ -106,6 +126,11 @@ class OrthancHost(Host):
     def studyUUIDs(self) -> List[str]:
         """Orthanc identifiers of the studies this Host serves."""
         return list(self._studyUUIDs)
+
+    @property
+    def seriesUUIDs(self) -> Dict[str, List[str]]:
+        """The series each narrowed study is limited to; others are served whole."""
+        return {study: sorted(wanted) for study, wanted in self._seriesUUIDs.items()}
 
     @property
     def instanceUUIDs(self) -> List[str]:
@@ -206,22 +231,48 @@ class OrthancHost(Host):
             self.notifyStatus(Status.ERROR, "no application registered")
             return False
 
-        ds = self._app.getOutputData(instanceUUID)
+        data = self.encodeOutput(self._app.getOutputData(instanceUUID), instanceUUID)
+        if data is None:
+            return False
+        return self.storeOutput(instanceUUID, data)
+
+    # -- the two halves of an output, so that something can sit between them --
+
+    def encodeOutput(self, ds: Dataset, instanceUUID: str) -> Optional[bytes]:
+        """One output dataset as the bytes both sinks want, or None if it
+        cannot be written.
+
+        Encoded bytes rather than the Dataset are what is passed on and what a
+        caller holding output should keep: it is what `storeOutput` takes, it
+        is a fraction of the object graph pydicom keeps for the same instance,
+        and its length is a number, where a Dataset's footprint is a guess.
+        """
         buffer = io.BytesIO()
         try:
             pydicom.dcmwrite(buffer, ds, enforce_file_format=True)
         except Exception as exc:  # noqa: BLE001 - an unwritable dataset is the app's bug
             self.notifyStatus(Status.ERROR, f"could not encode output {instanceUUID}: {exc}")
-            return False
+            return None
+        return buffer.getvalue()
 
+    def storeOutput(self, instanceUUID: str, data: bytes) -> bool:
+        """Write one already-encoded output instance out, and upload it.
+
+        Split from notifyOutputAvailable so that the getting of the data and
+        the disposing of it are separable: StagingHost takes the output while
+        the Application's call is still in its hands, and comes back here only
+        for the instances a user then accepts. Replaying a staged output
+        through notifyOutputAvailable instead would ask the Application for
+        data it long since let go of.
+        """
         if self._outputDir is not None:
             outPath = self._outputDir / f"{instanceUUID}.dcm"
-            outPath.write_bytes(buffer.getvalue())
+            outPath.write_bytes(data)
             self.notifyStatus(Status.INFORMATION, f"wrote {outPath}")
 
         if self._uploadOutputs:
             try:
-                stored = self._client.post_instances(buffer.getvalue())
+                stored = self._client.post_instances(data)
             except Exception as exc:  # noqa: BLE001 - surface any HTTP error plainly
                 self.notifyStatus(Status.ERROR, f"could not upload output {instanceUUID}: {exc}")
                 return False
@@ -322,6 +373,21 @@ class OrthancHost(Host):
                 entry["ID"]: entry.get("MainDicomTags", {})
                 for entry in seriesEntries
             }
+            # None here means the whole study, so no test is made at all; a
+            # narrowed study is filtered on ParentSeries, which *is* the
+            # Orthanc series identifier the selection holds, so the test is
+            # one set membership per instance and no lookup.
+            wanted = self._seriesUUIDs.get(studyUUID)
+            if wanted is not None:
+                missing = sorted(wanted - set(seriesTags))
+                if missing:
+                    # Reported and carried on with, the way a study that could
+                    # not be read is: a front end restoring a selection is
+                    # stricter than this and refuses the run outright.
+                    self.notifyStatus(
+                        Status.ERROR,
+                        f"study {studyUUID} no longer has selected series {missing}")
+
             # Orthanc lists the children of a study in no documented order, so
             # they are put into DICOM order here: series by number, then the
             # instances within each series. Selected studies keep the order
@@ -329,6 +395,8 @@ class OrthancHost(Host):
             ordered = sorted(instanceEntries,
                              key=lambda entry: self._instanceOrder(entry, seriesTags))
             for entry in ordered:
+                if wanted is not None and entry.get("ParentSeries", "") not in wanted:
+                    continue
                 instances[entry["ID"]] = {
                     **studyTags,
                     **seriesTags.get(entry.get("ParentSeries", ""), {}),
@@ -356,22 +424,8 @@ class OrthancHost(Host):
         series = seriesTags.get(entry.get("ParentSeries", ""), {})
         tags = entry.get("MainDicomTags", {})
         return (
-            OrthancHost._asNumber(series.get("SeriesNumber")),
+            asNumber(series.get("SeriesNumber")),
             str(series.get("SeriesInstanceUID", "")),
-            OrthancHost._asNumber(tags.get("InstanceNumber")),
+            asNumber(tags.get("InstanceNumber")),
             str(tags.get("SOPInstanceUID", "")),
         )
-
-    @staticmethod
-    def _asNumber(value: object) -> tuple:
-        """An IS tag as a sortable number; anything unusable sorts last.
-
-        These arrive as strings, so comparing them as written would put "10"
-        before "2". A missing or malformed number cannot be guessed at, and
-        pretending it is 0 would push those instances in front of the numbered
-        ones instead of after them.
-        """
-        try:
-            return (0, int(str(value).strip()))
-        except (TypeError, ValueError):
-            return (1, 0)

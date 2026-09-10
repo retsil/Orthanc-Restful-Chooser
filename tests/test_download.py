@@ -571,6 +571,23 @@ class TestDownloadCli(unittest.TestCase):
 
         self.assertEqual(code, 1)
 
+    def test_a_selection_file_that_does_not_describe_a_selection_is_an_error(self):
+        from unittest import mock
+
+        from OrthancRC.examples.download import cli
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "selection.json"
+            # Parses, but says two things at once.
+            path.write_text('{"criteria": {}, "selection_level": "series", '
+                            '"study_uids": ["s1"]}')
+            with mock.patch.object(cli, "Orthanc"):
+                code = cli.main([
+                    "--from-selection-file", str(path),
+                    "--target-folder", folder,
+                ])
+        self.assertEqual(code, 1)
+
     def test_unreadable_selection_file_is_an_error(self):
         from unittest import mock
 
