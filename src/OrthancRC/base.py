@@ -40,7 +40,14 @@ class Host(ABC):
         ...
 
     @abstractmethod
-    def notifyOutputAvailable(self, instanceUUID: str, mainTags: dict[str, object], lastData: bool) -> bool:
+    def notifyOutputAvailable(self, instanceUUID: str, lastData: bool) -> bool:
+        """Announce an output, which the Host takes with getOutputData().
+
+        Unlike notifyInputAvailable() there are no main tags: the Host asks for
+        the dataset from inside this call, so anything it wants to know about
+        the output it reads there, and an Application is not made to summarise
+        what it is about to hand over whole.
+        """
         ...
 
     @abstractmethod

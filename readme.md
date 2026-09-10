@@ -38,6 +38,7 @@ Installing puts three commands on the path:
 | `orthancrc-browser` | `OrthancRC.curses.browser` | `orthanc` |
 | `orthancrc-download` | `OrthancRC.examples.download.cli` | `orthanc` |
 
+Similar projects include https://github.com/Ch00k/orthanc-cli
 ### Requirements
 
 Requirements are declared in `pyproject.toml`, which is the one place to change
@@ -87,11 +88,13 @@ I've simplified it to:
 
 When returning data to the Host:
 
-1. Application calls `Host.notifyOutputAvailable(UUID, mainTags)`
+1. Application calls `Host.notifyOutputAvailable(UUID)`
 2. Host calls `Application.getOutputData(UUID)`, returning a pydicom object
 
 mainTags for instances are defined in Orthanc. I have included all main tags
-from the Patient, Study, Series and Instance levels.
+from the Patient, Study, Series and Instance levels. They only travel with
+inputs: the Host takes each output whole from inside `notifyOutputAvailable()`,
+so it reads whatever it needs off the dataset itself.
 
 Some modules such as `OrthancRC.examples.download` use a separate transfer
 thread to improve transfer speed.
@@ -124,7 +127,6 @@ with four abstract methods, so all four have to be defined:
 ```python
 from OrthancRC.base import Application, Host
 from OrthancRC.enums import State
-from OrthancRC.orthanc_util import extractMainTags
 from pydicom.dataset import Dataset
 
 
@@ -144,7 +146,7 @@ class MyNewInstance(Application):
         ds = self._host.getInputData(instanceUUID)   # only if the tags interest you
         ...                                          # the processing itself
         self._outputs[outputUUID] = result
-        self._host.notifyOutputAvailable(outputUUID, extractMainTags(result), lastData)
+        self._host.notifyOutputAvailable(outputUUID, lastData)
         if lastData:
             self._host.notifyStateChanged(State.COMPLETED)
         return True
@@ -260,7 +262,7 @@ sequenceDiagram
         H-->>A: pydicom Dataset
         Note over H,O: taking the data starts the download<br/>of the next prefetchDepth instances
         A->>A: deep copy, fresh SOPInstanceUID
-        A->>H: notifyOutputAvailable(outputUUID, mainTags, lastData)
+        A->>H: notifyOutputAvailable(outputUUID, lastData)
         H->>A: getOutputData(outputUUID)
         A-->>H: cloned Dataset
         opt --output-dir given

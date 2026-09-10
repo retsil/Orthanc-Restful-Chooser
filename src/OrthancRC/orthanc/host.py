@@ -226,7 +226,7 @@ class OrthancHost(Host):
             self.notifyStatus(Status.ERROR, f"could not download {instanceUUID}: {exc}")
             return Dataset()
 
-    def notifyOutputAvailable(self, instanceUUID: str, mainTags: dict[str, object], lastData: bool) -> bool:
+    def notifyOutputAvailable(self, instanceUUID: str, lastData: bool) -> bool:
         if self._app is None:
             self.notifyStatus(Status.ERROR, "no application registered")
             return False

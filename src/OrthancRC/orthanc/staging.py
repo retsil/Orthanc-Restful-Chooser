@@ -250,7 +250,7 @@ class StagingHost(Host):
 
     # -- the one call that is intercepted ---------------------------------
 
-    def notifyOutputAvailable(self, instanceUUID: str, mainTags: dict[str, object], lastData: bool) -> bool:
+    def notifyOutputAvailable(self, instanceUUID: str, lastData: bool) -> bool:
         if self._app is None:
             self.notifyStatus(Status.ERROR, "no application registered")
             return False
@@ -258,13 +258,14 @@ class StagingHost(Host):
         # Taken and encoded here, inside the Application's own call, so that
         # an unencodable dataset is still reported by the call that produced
         # it and nothing is ever asked of the Application afterwards.
-        data = self._host.encodeOutput(self._app.getOutputData(instanceUUID), instanceUUID)
+        ds = self._app.getOutputData(instanceUUID)
+        data = self._host.encodeOutput(ds, instanceUUID)
         if data is None:
             return False
 
         staged = _StagedInstance(
             instanceUUID=instanceUUID,
-            seriesKey=self._rowFor(instanceUUID, mainTags, len(data)),
+            seriesKey=self._rowFor(instanceUUID, ds, len(data)),
             size=len(data),
         )
         if self._heldBytes + len(data) <= self._outputCacheBytes:
@@ -323,15 +324,18 @@ class StagingHost(Host):
 
     # -- internals ---------------------------------------------------------
 
-    def _rowFor(self, instanceUUID: str, mainTags: dict, size: int) -> str:
+    def _rowFor(self, instanceUUID: str, ds: Dataset, size: int) -> str:
         """Find or start the table row this output instance belongs to.
 
         Grouped by SeriesInstanceUID, which is the one place in this design
         where a DICOM UID rather than an Orthanc identifier is the right key:
         an output instance has no Orthanc identity until it is uploaded, and
         the point of the table is to decide whether it ever will be.
+
+        Read off the output itself, so the row describes what will actually be
+        stored rather than what the Application said about it.
         """
-        seriesUID = str(mainTags.get("SeriesInstanceUID", "") or "")
+        seriesUID = str(ds.get("SeriesInstanceUID", "") or "")
         # An output the Application gave no series gets a row to itself rather
         # than being dropped or lumped in with another: a row a user can
         # reject is fine, output vanishing from the table is not.
@@ -342,9 +346,9 @@ class StagingHost(Host):
             self._series[key] = StagedSeries(
                 key=key,
                 seriesInstanceUID=seriesUID,
-                seriesNumber=str(mainTags.get("SeriesNumber", "") or ""),
-                modality=str(mainTags.get("Modality", "") or ""),
-                description=str(mainTags.get("SeriesDescription", "") or ""),
+                seriesNumber=str(ds.get("SeriesNumber", "") or ""),
+                modality=str(ds.get("Modality", "") or ""),
+                description=str(ds.get("SeriesDescription", "") or ""),
                 instanceCount=1,
                 byteCount=size,
             )

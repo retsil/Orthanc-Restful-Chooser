@@ -19,10 +19,7 @@ from pathlib import Path
 from pydicom.dataset import Dataset
 
 from ...base import Host, Application
-from ...orthanc_util import (
-    extractMainTags,
-    instanceUUIDFor,
-)
+from ...orthanc_util import instanceUUIDFor
 from ...enums import (
     State,
     Status,
@@ -58,8 +55,7 @@ class CloneInstances(Application):
             ds.file_meta.MediaStorageSOPInstanceUID = newSopUID
         outputUUID = instanceUUIDFor(ds)
         self._outputs[outputUUID] = ds
-        outputTags = extractMainTags(ds)
-        self._host.notifyOutputAvailable(outputUUID, outputTags, lastData)
+        self._host.notifyOutputAvailable(outputUUID, lastData)
 
         if lastData:
             self._host.notifyStateChanged(State.COMPLETED)

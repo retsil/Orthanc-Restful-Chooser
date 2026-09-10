@@ -59,6 +59,9 @@ class ForgetfulApp:
     def __init__(self, host) -> None:
         self.host = host
         self.asked: list = []
+        # {instance UUID: series tags its output is stamped with}; one not
+        # listed keeps the sample file's own.
+        self.series: dict = {}
         self._open = True
 
     def close(self) -> None:
@@ -71,15 +74,18 @@ class ForgetfulApp:
                 f"asked for {instanceUUID} after the Application let go")
         ds = pydicom.dcmread(str(DATA_FILE))
         ds.SOPInstanceUID = f"1.3.{instanceUUID}"
+        for keyword, value in self.series.get(instanceUUID, {}).items():
+            if value is None:
+                delattr(ds, keyword)
+            else:
+                setattr(ds, keyword, value)
         return ds
 
 
 def _tags(seriesUID, number="1", modality="CT", description="head") -> dict:
-    tags = {"SeriesNumber": number, "Modality": modality,
-            "SeriesDescription": description}
-    if seriesUID is not None:
-        tags["SeriesInstanceUID"] = seriesUID
-    return tags
+    # None drops SeriesInstanceUID from the output altogether.
+    return {"SeriesNumber": number, "Modality": modality,
+            "SeriesDescription": description, "SeriesInstanceUID": seriesUID}
 
 
 class StagingTest(unittest.TestCase):
@@ -103,8 +109,8 @@ class StagingTest(unittest.TestCase):
 
     def _stage(self, staging, *instances) -> None:
         for uuid, seriesUID in instances:
-            self.assertTrue(
-                staging.notifyOutputAvailable(uuid, _tags(seriesUID), False))
+            staging._app.series[uuid] = _tags(seriesUID)
+            self.assertTrue(staging.notifyOutputAvailable(uuid, False))
 
     def _written(self) -> list:
         out = self.folder / "out"
@@ -134,13 +140,13 @@ class StagingTest(unittest.TestCase):
         staging, app = self._staging()
         app.getOutputData = lambda uuid: pydicom.Dataset()
 
-        self.assertFalse(staging.notifyOutputAvailable("i1", _tags("1.2.1"), True))
+        self.assertFalse(staging.notifyOutputAvailable("i1", True))
         self.assertIn("could not encode output", staging.messages[-1][1])
         self.assertEqual(staging.stagedOutputs, [])
 
     def test_a_host_with_no_application_reports_it(self):
         staging = StagingHost(self.host)
-        self.assertFalse(staging.notifyOutputAvailable("i1", {}, True))
+        self.assertFalse(staging.notifyOutputAvailable("i1", True))
         self.assertIn("no application registered", staging.messages[-1][1])
 
     # -- the table --------------------------------------------------------
@@ -155,11 +161,11 @@ class StagingTest(unittest.TestCase):
         # A count of output instances, which is not the size of any input.
         self.assertEqual([row.instanceCount for row in rows], [2, 1])
 
-    def test_a_row_carries_what_the_application_said_about_its_series(self):
-        staging, _app = self._staging()
-        staging.notifyOutputAvailable(
-            "i1", _tags("1.2.9", number="7", modality="MR",
-                        description="brain"), True)
+    def test_a_row_carries_what_the_output_says_about_its_series(self):
+        staging, app = self._staging()
+        app.series["i1"] = _tags("1.2.9", number="7", modality="MR",
+                                 description="brain")
+        staging.notifyOutputAvailable("i1", True)
 
         row = staging.stagedOutputs[0]
         self.assertEqual((row.seriesNumber, row.modality, row.description),
@@ -291,8 +297,9 @@ class StagingTest(unittest.TestCase):
         # What one of this Application's outputs actually encodes to, rather
         # than the file on disk: it stamps each one, and i1 and i2 encode to
         # the same length.
-        one = len(self.host.encodeOutput(
-            ForgetfulApp(None).getOutputData("i1"), "i1"))
+        sizer = ForgetfulApp(None)
+        sizer.series["i1"] = _tags("1.2.1")
+        one = len(self.host.encodeOutput(sizer.getOutputData("i1"), "i1"))
 
         staging, _app = self._staging(outputCacheBytes=one)
         self._stage(staging, ("i1", "1.2.1"), ("i2", "1.2.1"))

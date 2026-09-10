@@ -1,0 +1,12 @@
+# Requirements for a development checkout: the project itself, installed in
+# editable mode, together with the "orthanc" extra that the Orthanc host, the
+# study browser and the example Applications need.
+#
+#     python3 -m pip install -r requirements.txt
+#
+# The requirements themselves are declared in pyproject.toml under
+# [project] dependencies and [project.optional-dependencies]; this file only
+# points pip at them, so add or change a dependency there and not here.
+#
+# Drop the extra for the framework and pydicom alone.
+-e .[orthanc]

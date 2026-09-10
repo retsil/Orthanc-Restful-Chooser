@@ -643,7 +643,7 @@ class OutputTest(unittest.TestCase):
             app = self.OutputApp()
             host.setApplication(app)
 
-            self.assertTrue(host.notifyOutputAvailable("i1", {}, True))
+            self.assertTrue(host.notifyOutputAvailable("i1", True))
 
             written = Path(folder) / "out" / "i1.dcm"
             self.assertTrue(written.exists())
@@ -668,7 +668,7 @@ class OutputTest(unittest.TestCase):
             host = self._host(folder, uploadOutputs=False)
             host.setApplication(self.OutputApp(ds=pydicom.Dataset()))
 
-            self.assertFalse(host.notifyOutputAvailable("i1", {}, True))
+            self.assertFalse(host.notifyOutputAvailable("i1", True))
 
         self.assertEqual(host.messages[-1][0], Status.ERROR)
         self.assertIn("could not encode output", host.messages[-1][1])

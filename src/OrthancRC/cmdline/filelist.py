@@ -74,7 +74,7 @@ class CmdLineHost(Host):
     def getInputData(self, instanceUUID: str) -> Dataset:
         return self._inputs.get(instanceUUID, Dataset())
 
-    def notifyOutputAvailable(self, instanceUUID: str, mainTags: dict[str, object], lastData: bool) -> bool:
+    def notifyOutputAvailable(self, instanceUUID: str, lastData: bool) -> bool:
         if self._app is None:
             self.notifyStatus(Status.ERROR, "no application registered")
             return False
