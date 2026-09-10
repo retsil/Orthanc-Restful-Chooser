@@ -69,6 +69,66 @@ PS 3.19. I have included the following functions:
 - `Host.getTmpDir()`
 - `Host.generateUID()`
 
+## Writing an Application
+
+An Application is a subclass of `OrthancRC.base.Application`, which is an ABC
+with four abstract methods, so all four have to be defined:
+
+```python
+from OrthancRC.base import Application, Host
+from OrthancRC.enums import State
+from OrthancRC.orthanc_util import extractMainTags
+from pydicom.dataset import Dataset
+
+
+class MyNewInstance(Application):
+    """One line saying what this Application does."""
+
+    __version__ = 1.0
+    __description__ = "One line saying what this Application does."
+
+    def __init__(self, host: Host) -> None:
+        self._host = host
+        self._outputs: dict[str, Dataset] = {}
+        self._host.notifyStateChanged(State.IDLE)
+
+    def notifyInputAvailable(self, instanceUUID: str, mainTags: dict[str, object],
+                             lastData: bool) -> bool:
+        ds = self._host.getInputData(instanceUUID)   # only if the tags interest you
+        ...                                          # the processing itself
+        self._outputs[outputUUID] = result
+        self._host.notifyOutputAvailable(outputUUID, extractMainTags(result), lastData)
+        if lastData:
+            self._host.notifyStateChanged(State.COMPLETED)
+        return True
+
+    def getOutputData(self, instanceUUID: str) -> Dataset:
+        return self._outputs.get(instanceUUID, Dataset())
+
+    def bringApplicationToFront(self) -> bool:
+        return False    # headless: nothing to raise
+```
+
+`__init__` takes the Host and nothing else, because that is the signature every
+front end constructs against: `--module` imports the named module, takes the
+first `Application` subclass it defines, and calls `ApplicationClass(host)`.
+Configuration of its own therefore has to arrive some other way -- the download
+example parses its own command line before the Host is built.
+
+`getOutputData()` is called from inside the `notifyOutputAvailable()` that
+announced the output, and never after that call returns, so an Application may
+build output on demand and drop it as soon as the call is over. There is no
+`releaseData()` in this interface to say otherwise; a Host that wants to hold
+output back, as `--stage` does, keeps it itself rather than asking again later.
+
+Nothing obliges an Application to produce output at all: one that only reads
+main tags and never calls `notifyOutputAvailable()` -- the download example
+again -- is a complete Application, and skipping `getInputData()` for the
+instances it does not want is what keeps them from being pulled from Orthanc.
+
+`OrthancRC.examples.clone` is this skeleton filled in and is about as small as
+a working Application gets.
+
 ## Example reference implementation
 
 Command line:
@@ -218,65 +278,28 @@ python3.13 -m OrthancRC.curses --module OrthancRC.examples.clone \
     --stage --output-dir ./out
 ```
 
-The table is one row per output series with a count of the output instances in
-it -- which is not the size of the input series, since an Application may emit
-one output per input, or fewer, or more -- and every row starts accepted. So
-`--stage` is a review step rather than an opt-in: confirming the table
-untouched does exactly what the same run without `--stage` would have done,
-and rejecting is the action. There is no cancel on that screen, because the
-run is already over and there would be nothing to cancel to; the ways out are
-ENTER and an explicit `n`. A series that is rejected is never written and
-never uploaded, and `getOutputData()` is never called for it.
+Each series is accepted or rejected on its own, and only the accepted ones are
+written to `--output-dir` and uploaded to Orthanc. There is no cancel on that
+screen, because the run is already over.
 
-The Application sees no change at all. Its `getOutputData()` is called once,
-synchronously, from inside its own `notifyOutputAvailable()`, exactly where it
-is called without `--stage`, so an Application that builds its output on
-demand and frees it when the call returns works staged too. That is deliberate
-rather than incidental: this interface has no `releaseData()`, so nothing
-would tell an Application when it may free an output the Host asked it to
-keep, and a Host that deferred the call until after the run would be asking
-for data every reasonable Application has already dropped. The Host therefore
-takes the output while the call is in its hands and takes responsibility for
-it afterwards.
-
-Which means holding it. Encoded output is kept in memory up to
-`--output-cache` (a byte count with an optional `K`/`M`/`G` suffix, default
-`128M`) and written to a spill file in the host's temporary directory past
-that, deleted at the end of the review whether its series was accepted or
-rejected. 128 MB is roughly 250 512x512 16-bit CT slices, two or three typical
-series; a large single frame -- mammography, whole-slide -- spills almost at
-once, which is the right outcome for output that should not be accumulating in
-a Python process. `--output-cache 0` spills everything. What was held and what
-was spilled is reported at the end of a run, since that is the only way to
-find out the number was too low for the work. It is a ceiling on output held,
-on top of the `prefetchDepth` decoded input datasets the prefetch window may
-hold.
-
-None of that lives in the terminal front end. `StagingHost` wraps an
-`OrthancHost` and intercepts exactly one call, forwarding everything else, so
-it has one tmp dir and one message list between the two; `curses` contributes
-the y/n screen and nothing more.
+Encoded output is kept in memory up to `--output-cache` (a byte count with an
+optional `K`/`M`/`G` suffix, default `128M`) and spilled to a file in the
+host's temporary directory past that, deleted at the end of the review whether
+its series was accepted or rejected.
 
 ### Prefetching input
 
-Taking an instance's data starts the download of the next few on a small
-thread pool, so the following `getInputData()` usually only waits for a request
-that is already in flight. The window is `OrthancHost(..., prefetchDepth=2)`
-instances deep; `prefetchDepth=0` turns it off and fetches each instance at the
-moment it is asked for.
+Instances are downloaded ahead of the Application on a small thread pool, so
+that the next one is usually already in hand when it is asked for.
+`OrthancHost(..., prefetchDepth=N)` sets how many run ahead -- 2 by default,
+`0` waits for each download at the moment it is asked for. The pool never has
+more than four workers; a deeper window simply queues.
 
-It is worth having: downloading a selection over a local network measured
-about 11 MB/s with `prefetchDepth=0` and about 22 MB/s at the default depth of
-2, as reported by the download example's own rate (see below). Serial fetching
-spends most of a run waiting for the server to answer, and that is the time the
-pool fills.
+The window follows the Application's claims, not the order inputs are offered
+in: an Application that filters on main tags -- as the download example does --
+never asks for the data of most instances, and fetching those anyway would pull
+the whole selection over just to throw it away.
 
-Prefetching follows what the Application takes, not where `sendInputs()` has
-got to, so it costs nothing for an Application that filters on main tags and
-asks for few instances, and it works just as well for one that reads every main
-tag first and only asks for the data afterwards -- from the last input, or once
-the run is over. In that last case call `host.close()` when done, to stop the
-pool `sendInputs()` is no longer around to close.
 
 ### Using the Host directly
 
