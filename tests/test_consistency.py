@@ -791,6 +791,20 @@ class BareIntTest(_Folder):
         self.assertIn((Status.ERROR, "unknown level"), host.messages)
         self.assertIn("99 is not a Status", " ".join(_texts(host, Status.ERROR)))
 
+    def test_a_member_of_the_other_enum_is_an_error_not_a_conversion(self):
+        # State.COMPLETED is 2, which is Status.WARNING: a wrong-enum bug
+        # that must not pass as a quietly converted bare int.
+        for host in (self._orthancHost(), CmdLineHost([DATA_FILE], self.folder / "cmd")):
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                host.notifyStatus(State.COMPLETED, "sent as a state")
+                host.notifyStateChanged(Status.ERROR)
+            self.assertIn((Status.ERROR, "sent as a state"), host.messages)
+            errors = " ".join(_texts(host, Status.ERROR))
+            self.assertIn("is a State, not a Status", errors)
+            self.assertIn("is a Status, not a State", errors)
+            self.assertEqual(_texts(host, Status.WARNING), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,11 +22,10 @@ import pydicom
 from pydicom.dataset import Dataset
 from pydicom.uid import generate_uid
 
-from ..base import Host, Application
+from ..base import Host, Application, ReportingHost
 from ..enums import (
-    State,
     Status,
-    asEnum,
+    reportedError,
 )
 from ..loader import loadApplicationClass
 from ..orthanc_util import (
@@ -40,7 +39,7 @@ from ..orthanc_util import (
 _IDENTITY_TAGS = ("PatientID", "StudyInstanceUID", "SeriesInstanceUID", "SOPInstanceUID")
 
 
-class CmdLineHost(Host):
+class CmdLineHost(ReportingHost):
     """A minimal command-line Host: no GUI, reports state/status to stdout.
 
     Input DICOM files are read up front and indexed by Orthanc instance UUID.
@@ -129,21 +128,8 @@ class CmdLineHost(Host):
         self.notifyStatus(Status.INFORMATION, f"wrote {outPath}")
         return True
 
-    def notifyStateChanged(self, value: State) -> None:
-        state, problem = asEnum(State, value)
-        if problem is not None:
-            self.notifyStatus(Status.WARNING if state is not None else Status.ERROR, problem)
-        if state is not None:
-            print(f"[state] {state.name}")
-
-    def notifyStatus(self, value: Status, text: str) -> None:
-        status, problem = asEnum(Status, value)
-        # Not `status or ERROR`: INFORMATION is 0.
-        level = status if status is not None else Status.ERROR
-        self.messages.append((level, text))
-        print(f"[{level.name}] {text}")
-        if problem is not None:
-            self.notifyStatus(Status.WARNING if status is not None else Status.ERROR, problem)
+    def _printLine(self, line: str) -> None:
+        print(line)
 
 
 def collectInputFiles(args: argparse.Namespace) -> list[Path]:
@@ -232,7 +218,7 @@ def runApplication(args: argparse.Namespace,
 
     # Every input accepted is not the same as the run having worked: an output
     # that could not be written was reported, and must not exit 0.
-    if any(status in (Status.ERROR, Status.FATALERROR) for status, _text in host.messages):
+    if reportedError(host.messages):
         raise SystemExit(1)
 
 

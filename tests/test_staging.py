@@ -20,6 +20,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import pydicom
 
@@ -335,6 +336,27 @@ class StagingTest(unittest.TestCase):
 
         self.assertEqual(self._spillFiles(), [])
         self.assertEqual(self._written(), [])
+
+    def test_a_spill_file_that_will_not_go_does_not_keep_the_rest(self):
+        staging, _app = self._staging(outputCacheBytes=0)
+        self._stage(staging, ("i1", "1.2.1"), ("i2", "1.2.1"))
+        stuck = self.host.getTmpDir() / "staged-output" / "i1.dcm"
+        unlink = Path.unlink
+
+        def lockedUnlink(path, *args, **kwargs):
+            if path == stuck:
+                raise PermissionError("locked")
+            return unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", lockedUnlink):
+            staging.discardStagedOutputs()
+
+        # The other file went, the review is over, and the one left is named.
+        self.assertEqual(self._spillFiles(), ["i1.dcm"])
+        self.assertEqual(staging.stagedOutputs, [])
+        self.assertEqual(staging.spilledBytes, 0)
+        errors = [text for status, text in self.host.messages if status is Status.ERROR]
+        self.assertTrue(any("locked" in text and "i1.dcm" in text for text in errors))
 
     def _spillFiles(self) -> list:
         spill = self.host.getTmpDir() / "staged-output"

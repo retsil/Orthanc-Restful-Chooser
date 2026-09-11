@@ -35,7 +35,6 @@ Orthanc (and/or written to disk).
 """
 
 import io
-import sys
 import tempfile
 import threading
 from collections import Counter
@@ -48,13 +47,13 @@ from pydicom.dataset import Dataset
 from pydicom.uid import generate_uid
 from pyorthanc import Orthanc
 
-from ..base import Application, Host
-from ..enums import State, Status, asEnum
+from ..base import Application, ReportingHost
+from ..enums import Status
 from ..orthanc_util import asNumber, outputProblems
 from ..selection import load_selection
 
 
-class OrthancHost(Host):
+class OrthancHost(ReportingHost):
     """Host serving the DICOM instances of a set of Orthanc studies."""
 
     def __init__(
@@ -130,8 +129,8 @@ class OrthancHost(Host):
         # it has returned, to hold _pending to the promise made above.
         self._runThread: Optional[int] = None
         self._runOver = False
-        self._warnedThread = False
-        self._warnedAfterRun = False
+        # Warnings given once each rather than per call; see _warnOnce().
+        self._warned: Set[str] = set()
 
     # -- construction from a saved selection ------------------------------
 
@@ -359,24 +358,6 @@ class OrthancHost(Host):
 
         return True
 
-    def notifyStateChanged(self, value: State) -> None:
-        state, problem = asEnum(State, value)
-        if problem is not None:
-            self.notifyStatus(Status.WARNING if state is not None else Status.ERROR, problem)
-        if state is not None:
-            print(f"[state] {state.name}", file=sys.stderr)
-
-    def notifyStatus(self, value: Status, text: str) -> None:
-        status, problem = asEnum(Status, value)
-        # The message is kept whatever it was sent as: an unknown level is
-        # recorded as an error, so it can neither vanish nor pass as benign.
-        # Not `status or ERROR`: INFORMATION is 0.
-        level = status if status is not None else Status.ERROR
-        self.messages.append((level, text))
-        print(f"[{level.name}] {text}", file=sys.stderr)
-        if problem is not None:
-            self.notifyStatus(Status.WARNING if status is not None else Status.ERROR, problem)
-
     # -- internals ---------------------------------------------------------
 
     def _checkCallingThread(self) -> None:
@@ -389,16 +370,17 @@ class OrthancHost(Host):
         if self._runThread is None:
             return
         if self._runOver:
-            if not self._warnedAfterRun:
-                self._warnedAfterRun = True
-                self.notifyStatus(
-                    Status.WARNING, "input data asked for after sendInputs() "
-                                    "returned; call close() when done with it")
-        elif threading.get_ident() != self._runThread and not self._warnedThread:
-            self._warnedThread = True
-            self.notifyStatus(
-                Status.WARNING, "input data asked for from a thread other than "
-                                "the one sendInputs() is running on")
+            self._warnOnce("after run", "input data asked for after sendInputs() "
+                                        "returned; call close() when done with it")
+        elif threading.get_ident() != self._runThread:
+            self._warnOnce("other thread", "input data asked for from a thread other "
+                                           "than the one sendInputs() is running on")
+
+    def _warnOnce(self, key: str, text: str) -> None:
+        """Report a WARNING the first time `key` comes up, and never again."""
+        if key not in self._warned:
+            self._warned.add(key)
+            self.notifyStatus(Status.WARNING, text)
 
     def _download(self, instanceUUID: str) -> Dataset:
         """Fetch and parse one instance; runs on a prefetch thread.
@@ -504,7 +486,8 @@ class OrthancHost(Host):
                                         f"holds {len(held)} instance(s) but "
                                         f"{listed[entry['ID']]} were listed; it "
                                         "changed while being read")
-            orphans = sorted(set(listed) - set(seriesTags))
+            listedSeries = set(seriesTags)
+            orphans = sorted(set(listed) - listedSeries)
             if orphans:
                 # Still offered, with only the study's tags, and sorted last.
                 self.notifyStatus(
@@ -516,7 +499,7 @@ class OrthancHost(Host):
             # one set membership per instance and no lookup.
             wanted = self._seriesUUIDs.get(studyUUID)
             if wanted is not None:
-                missing = sorted(wanted - set(seriesTags))
+                missing = sorted(wanted - listedSeries)
                 if missing:
                     # Reported and carried on with, the way a study that could
                     # not be read is: a front end restoring a selection is

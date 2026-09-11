@@ -65,10 +65,15 @@ class CloneInstances(Application):
         ds = cloneInstance(self._host.getInputData(instanceUUID), self._host.generateUID())
         outputUUID = instanceUUIDFor(ds)
         self._outputs[outputUUID] = ds
-        # False is the host saying it could not take the output: the reason
-        # is in its own status, but it should not look like success here.
-        if not self._host.notifyOutputAvailable(outputUUID, lastData):
-            self._refused += 1
+        try:
+            # False is the host saying it could not take the output: the
+            # reason is in its own status, but it should not look like success.
+            if not self._host.notifyOutputAvailable(outputUUID, lastData):
+                self._refused += 1
+        finally:
+            # The host takes the output from inside that call and never asks
+            # again, so there is no reason to hold every clone in memory.
+            del self._outputs[outputUUID]
 
         if lastData:
             if self._refused:

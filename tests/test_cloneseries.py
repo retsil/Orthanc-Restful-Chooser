@@ -163,6 +163,23 @@ class CloneSeriesRunTest(unittest.TestCase):
         app = self._run()
         self.assertEqual(app._outputs, {})
 
+    def test_inputs_without_a_series_uid_are_not_merged_into_one_clone(self):
+        # Two inputs from series nothing can tell apart: each is cloned alone,
+        # rather than into one series of every input that lacks the UID.
+        for _ in range(2):
+            ds = pydicom.dcmread(str(DATA_FILE))
+            del ds.SeriesInstanceUID
+            ds.SOPInstanceUID = str(generate_uid())
+            ds.file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
+            ds.save_as(str(self.inputDir / f"{ds.SOPInstanceUID}.dcm"),
+                       enforce_file_format=True)
+        app = self._run()
+
+        bySeries = self._outputsBySeries()
+        self.assertEqual(len(bySeries), 2)
+        self.assertNotIn("", bySeries)
+        self.assertEqual(app.seriesUIDs, {})
+
 
 class SuffixedDescriptionTest(unittest.TestCase):
     def test_the_suffix_is_appended(self):

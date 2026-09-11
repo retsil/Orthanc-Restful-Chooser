@@ -13,7 +13,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from enum import IntEnum
+from collections.abc import Iterable
+from enum import Enum, IntEnum
 
 # Using IntEnum for compatibility with WG23
 
@@ -33,16 +34,28 @@ class Status(IntEnum):
     FATALERROR = 3
 
 
+def reportedError(messages: Iterable[tuple[Status, str]]) -> bool:
+    """Whether any of a Host's (Status, text) messages says the run failed.
+
+    What every front end exits non-zero on, so that they all agree on it.
+    """
+    return any(status in (Status.ERROR, Status.FATALERROR) for status, _text in messages)
+
+
 def asEnum(kind: type[IntEnum], value: object) -> tuple[IntEnum | None, str | None]:
     """value as a member of kind, and what was wrong with it if anything.
 
     An Application written against the WG23 numbers may pass a bare int, which
     has no .name for a Host to print. A number in range is converted and
     reported; one out of range comes back as None, for the Host to report as
-    an error rather than raise inside the Application's call.
+    an error rather than raise inside the Application's call. So does a member
+    of another enum: State.COMPLETED is 2, but passing it as a Status is a bug
+    to report, not a Status.WARNING to quietly record.
     """
     if isinstance(value, kind):
         return value, None
+    if isinstance(value, Enum):
+        return None, f"{value!r} is a {type(value).__name__}, not a {kind.__name__}"
     try:
         member = kind(value)
     except ValueError:

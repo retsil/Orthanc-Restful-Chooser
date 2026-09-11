@@ -253,7 +253,12 @@ class StagingHost(Host):
         without a review, so that no patient data is left in the tmp dir.
         """
         for staged in self._staged:
-            staged.drop()
+            try:
+                staged.drop()
+            except OSError as exc:
+                # One file that will not go must not keep the rest: reported,
+                # and named again below when the directory cannot be removed.
+                self.notifyStatus(Status.ERROR, f"could not remove {staged.path}: {exc}")
         self._staged = []
         self._series = {}
         self._mixedRows = set()

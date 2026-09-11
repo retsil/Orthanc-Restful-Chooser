@@ -73,6 +73,9 @@ class CloneSeries(Application):
         # Orthanc series UUID because the dataset is what carries it, whatever
         # the host.
         self._seriesUIDs: dict[str, str] = {}
+        # Series drawn for inputs with no SeriesInstanceUID, one each; they
+        # have no key to go in the map above under.
+        self._unkeyedSeries = 0
         self._outputs: dict[str, Dataset] = {}
         self._cloned = 0
         self._failed = 0
@@ -103,8 +106,9 @@ class CloneSeries(Application):
         if lastData:
             self._host.notifyStatus(
                 Status.INFORMATION,
-                f"cloned {self._cloned} instance(s) in {len(self._seriesUIDs)} "
-                f"series, failed {self._failed}",
+                f"cloned {self._cloned} instance(s) in "
+                f"{len(self._seriesUIDs) + self._unkeyedSeries} series, "
+                f"failed {self._failed}",
             )
             self._host.notifyStateChanged(State.COMPLETED)
         return True
@@ -139,13 +143,23 @@ class CloneSeries(Application):
 
     def _outputSeriesUID(self, inputSeriesUID: str) -> str:
         """The clone's SeriesInstanceUID for an input series, drawn on first sight."""
+        if not inputSeriesUID:
+            # Nothing says which other inputs share its series, so it gets a
+            # series of its own rather than one with every other input that
+            # lacks the UID -- as StagingHost gives it a row of its own.
+            outputSeriesUID = self._host.generateUID()
+            self._unkeyedSeries += 1
+            self._host.notifyStatus(
+                Status.WARNING,
+                f"an input with no SeriesInstanceUID is cloned alone as {outputSeriesUID}",
+            )
+            return outputSeriesUID
         outputSeriesUID = self._seriesUIDs.get(inputSeriesUID)
         if outputSeriesUID is None:
             outputSeriesUID = self._host.generateUID()
             self._seriesUIDs[inputSeriesUID] = outputSeriesUID
             self._host.notifyStatus(
                 Status.INFORMATION,
-                f"series {inputSeriesUID or '(no SeriesInstanceUID)'} "
-                f"is cloned as {outputSeriesUID}",
+                f"series {inputSeriesUID} is cloned as {outputSeriesUID}",
             )
         return outputSeriesUID

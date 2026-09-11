@@ -52,7 +52,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 from pyorthanc import Orthanc
 
 from ..base import Application, Host
-from ..enums import Status
+from ..enums import reportedError
 from ..loader import loadApplicationClass
 from ..orthanc.host import OrthancHost
 from ..orthanc.staging import (DEFAULT_OUTPUT_CACHE_BYTES, StagedSeries,
@@ -774,7 +774,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Every input accepted is not the same as the run having worked: a study
     # that could not be read, a failed download or upload was reported, and
     # must not exit 0. StagingHost shares this message list.
-    if any(status in (Status.ERROR, Status.FATALERROR) for status, _text in host.messages):
+    if reportedError(host.messages):
         return 1
     return code
 

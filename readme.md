@@ -348,6 +348,25 @@ in: an Application that filters on main tags -- as the download example does --
 never asks for the data of most instances, and fetching those anyway would pull
 the whole selection over just to throw it away.
 
+### Using the Host directly
+
+The Host isn't part of the terminal front end. `OrthancHost` lives in
+`OrthancRC.orthanc` and knows only a list of study UUIDs, and optionally which
+series to take from each, so anything can pick them:
+
+- `OrthancHost.fromSelectionFile(client, path)` builds one from a selection
+  saved with `--save-selection`.
+- `OrthancRC.curses.browser.host_from_browser(client)` runs the picker and
+  returns a ready-made Host, or `None` if the user cancelled.
+
+Either way the Host is driven the same way as the browser drives it:
+
+```python
+host = OrthancHost.fromSelectionFile(client, "selection.json")
+host.setApplication(MyApplication(host))
+host.sendInputs()
+```
+
 ## Download example application
 
 An example Application with its own command line. It takes a study selection

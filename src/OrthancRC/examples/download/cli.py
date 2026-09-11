@@ -27,7 +27,7 @@ from typing import List, Optional
 
 from pyorthanc import Orthanc
 
-from ...enums import Status
+from ...enums import reportedError
 from ...orthanc.host import OrthancHost
 from .application import DownloadSeries
 
@@ -103,7 +103,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # could not read or a series that has gone, and carries on without it. The
     # listing happens anyway; doing it first lets it refuse the run instead.
     host.instanceUUIDs
-    if _reportedError(host):
+    if reportedError(host.messages):
         print("error: the selection no longer matches the archive; see above",
               file=sys.stderr)
         return 1
@@ -119,12 +119,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     host.setApplication(app)
     accepted = host.sendInputs()
     # A failed download or write was reported, and must not exit 0.
-    return 0 if accepted and not _reportedError(host) else 1
-
-
-def _reportedError(host: OrthancHost) -> bool:
-    return any(status in (Status.ERROR, Status.FATALERROR)
-               for status, _text in host.messages)
+    return 0 if accepted and not reportedError(host.messages) else 1
 
 
 if __name__ == "__main__":

@@ -62,6 +62,8 @@ class TestCmdLineOutput(unittest.TestCase):
             self.assertNotEqual(outputUID, inputUID)
             # File-meta UID must stay consistent with the dataset UID.
             self.assertEqual(str(outDs.file_meta.MediaStorageSOPInstanceUID), outputUID)
+            # Nor is the clone held once the host has taken it.
+            self.assertEqual(app._outputs, {})
 
             # Clean up the written file.
             outFile.unlink()
