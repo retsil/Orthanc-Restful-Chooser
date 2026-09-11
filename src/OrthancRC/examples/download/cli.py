@@ -27,6 +27,7 @@ from typing import List, Optional
 
 from pyorthanc import Orthanc
 
+from ...enums import Status
 from ...orthanc.host import OrthancHost
 from .application import DownloadSeries
 
@@ -98,6 +99,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"error: could not read --from-selection-file: {exc}", file=sys.stderr)
         return 1
 
+    # A restore is strict (see selection.py): the host only reports a study it
+    # could not read or a series that has gone, and carries on without it. The
+    # listing happens anyway; doing it first lets it refuse the run instead.
+    host.instanceUUIDs
+    if _reportedError(host):
+        print("error: the selection no longer matches the archive; see above",
+              file=sys.stderr)
+        return 1
+
     app = DownloadSeries(
         host,
         matchSeriesDescription=args.match_series_description,
@@ -107,7 +117,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         showProgress=not args.no_progress,
     )
     host.setApplication(app)
-    return 0 if host.sendInputs() else 1
+    accepted = host.sendInputs()
+    # A failed download or write was reported, and must not exit 0.
+    return 0 if accepted and not _reportedError(host) else 1
+
+
+def _reportedError(host: OrthancHost) -> bool:
+    return any(status in (Status.ERROR, Status.FATALERROR)
+               for status, _text in host.messages)
 
 
 if __name__ == "__main__":

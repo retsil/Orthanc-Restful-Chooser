@@ -14,14 +14,25 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import hashlib
+import re
+from collections.abc import Collection, Container
 
 from pydicom.dataset import Dataset
+
+from .enums import Status
+
+_ORTHANC_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{8}){4}")
 
 
 def _orthancHash(text: str) -> str:
     """Orthanc identifier: SHA-1 of text, formatted as 5 groups of 8 hex chars."""
     digest = hashlib.sha1(text.encode("utf-8")).hexdigest()  # 40 lowercase hex chars
     return "-".join(digest[i:i + 8] for i in range(0, 40, 8))
+
+
+def isOrthancID(text: str) -> bool:
+    """Whether text has the shape of an Orthanc identifier, as _orthancHash makes."""
+    return _ORTHANC_ID.fullmatch(text) is not None
 
 
 def patientUUID(patientID: str) -> str:
@@ -131,6 +142,60 @@ def instanceUUIDFor(ds: Dataset) -> str:
         str(ds.get("SeriesInstanceUID", "")),
         str(ds.get("SOPInstanceUID", "")),
     )
+
+
+def outputProblems(
+    ds: Dataset,
+    instanceUUID: str,
+    inputUUIDs: Container[str],
+    announced: Container[str],
+    patientIDs: Collection[str],
+    studyUIDs: Collection[str],
+) -> list[tuple[Status, str]]:
+    """What is wrong with an output a Host is about to take, as status lines.
+
+    An ERROR among them means the Host refuses the output; a WARNING only
+    reports. Shared by every Host so that each checks its output the same way,
+    and cheap enough for every output: one SHA-1 and a few lookups.
+
+    `announced` is the output UUIDs already taken this run. `patientIDs` and
+    `studyUIDs` are those of the inputs; empty means there are no inputs to
+    compare against, and the check is skipped.
+    """
+    if len(ds) == 0:
+        # Nothing else can be said about no data, and "could not encode" would
+        # point at the wrong cause.
+        return [(Status.ERROR, f"announced output {instanceUUID} but returned no data")]
+
+    problems: list[tuple[Status, str]] = []
+    if instanceUUID in announced:
+        # Every sink is named after the UUID, so a second output under it
+        # overwrites the first, in outputDir and in the staging spill alike.
+        problems.append(
+            (Status.ERROR, f"output {instanceUUID} was already announced in this run"))
+    identity = instanceUUIDFor(ds)
+    if identity in inputUUIDs:
+        # Orthanc would drop it as AlreadyStored, or overwrite the original.
+        problems.append(
+            (Status.ERROR, f"output {instanceUUID} has the identity of input "
+                           f"{identity}; it needs a new SOPInstanceUID"))
+    elif identity != instanceUUID:
+        # Not required by the interface, but it is the name every sink uses,
+        # and Orthanc will store the output as `identity` whatever it is called.
+        problems.append(
+            (Status.WARNING, f"output announced as {instanceUUID} has the "
+                             f"identity {identity}"))
+    patientID = str(ds.get("PatientID", ""))
+    if patientIDs and patientID not in patientIDs:
+        problems.append(
+            (Status.WARNING, f"output {instanceUUID} names patient {patientID!r}, "
+                             "who is not among the inputs"))
+    studyUID = str(ds.get("StudyInstanceUID", ""))
+    if studyUIDs and studyUID not in studyUIDs:
+        problems.append(
+            (Status.WARNING, f"output {instanceUUID} names study {studyUID!r}, "
+                             "which is not among the inputs"))
+    return problems
 
 
 def extractMainTags(ds: Dataset) -> dict[str, object]:

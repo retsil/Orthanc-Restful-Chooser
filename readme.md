@@ -38,22 +38,13 @@ Installing puts three commands on the path:
 | `orthancrc-browser` | `OrthancRC.curses.browser` | `orthanc` |
 | `orthancrc-download` | `OrthancRC.examples.download.cli` | `orthanc` |
 
-Similar projects include https://github.com/Ch00k/orthanc-cli
+Similar projects include https://github.com/Ch00k/orthanc-cli.
+
 ### Requirements
 
-Requirements are declared in `pyproject.toml`, which is the one place to change
-them:
-
-- `[project] requires-python` is the minimum interpreter, currently 3.10.
-- `[project] dependencies` holds the hard requirements: `pydicom>=3.0`.
-- `[project.optional-dependencies]` holds the extras: `orthanc` pulls in
-  `pyorthanc>=1.20`.
-- `[build-system] requires` holds build-time tools, which are installed by pip
-  during the build and are not runtime requirements.
-
-A `requirements.txt` is provided for the `pip install -r` workflow and a
-`setup.py` shim for tools that still invoke it, but neither carries any
-metadata of its own; both defer to `pyproject.toml`.
+All requirements are declared in `pyproject.toml`: Python 3.10+, `pydicom>=3.0`,
+and `pyorthanc>=1.20` for the `orthanc` extra. `requirements.txt` and `setup.py`
+are thin shims that defer to it.
 
 ## Python modules
 
@@ -68,33 +59,30 @@ containing a clone of the host interface object.
 
 ## DICOM objects
 
-Native objects in PS 3.19 were designed in the standard to be any object, but
-for our purposes they are DICOM objects. Native objects have descriptors, and
-conveniently they are identified by UUIDs, so Orthanc UUIDs are a perfect fit.
-Object descriptions also have a SOP class, but I have expanded this to include
-Orthanc main tags.
+PS 3.19 allows native objects to be any kind of object, but for our purposes
+they are DICOM objects. Native objects have descriptors and are identified by
+UUIDs, so Orthanc UUIDs are a perfect fit. Object descriptors also carry a SOP
+class, which this interface extends with the Orthanc main tags.
 
 ## Transferring data
 
 In PS 3.19, transferring data is a two-step process which is performed at the
-instance level. The reason for this is that for large data sets, getting data
-cannot happen on the UI thread. Also, it permits the use of a data selector
-before transferring data or loading objects into memory.
+instance level. This is because, for large data sets, fetching data cannot
+happen on the UI thread. It also allows a data selector to be used before data
+is transferred or objects are loaded into memory.
 
-I've simplified it to:
+This interface simplifies it to:
 
-1. Host calls `Application.notifyInputAvailable(UUID, mainTags)`
+1. Host calls `Application.notifyInputAvailable(UUID, mainTags, lastData)`
 2. Application calls `Host.getInputData(UUID)`, returning a pydicom object
 
 When returning data to the Host:
 
-1. Application calls `Host.notifyOutputAvailable(UUID)`
+1. Application calls `Host.notifyOutputAvailable(UUID, lastData)`
 2. Host calls `Application.getOutputData(UUID)`, returning a pydicom object
 
-mainTags for instances are defined in Orthanc. I have included all main tags
-from the Patient, Study, Series and Instance levels. They only travel with
-inputs: the Host takes each output whole from inside `notifyOutputAvailable()`,
-so it reads whatever it needs off the dataset itself.
+The `mainTags` for an instance are defined by Orthanc and should include tags
+from the Patient, Study, Series and Instance levels.
 
 Some modules such as `OrthancRC.examples.download` use a separate transfer
 thread to improve transfer speed.
@@ -106,13 +94,14 @@ the host via the `Host.notifyStateChanged` method. Sometimes a message is passed
 prior to a state change; this can be done through the
 `Host.notifyStatus(value, text)` method.
 
-- State values can be IDLE, INPROGRESS, COMPLETED, SUSPENDED, CANCELED, EXIT
-- Status values can be INFORMATION, ERROR, WARNING, FATALERROR
+- State values are `IDLE`, `INPROGRESS`, `COMPLETED`, `SUSPENDED`, `CANCELED`
+  and `EXIT`.
+- Status values are `INFORMATION`, `ERROR`, `WARNING` and `FATALERROR`.
 
 ## Windowing system
 
 Some additional helper functions are defined in the XIP implementation of
-PS 3.19. I have included the following functions:
+PS 3.19. To match it, this interface includes the following functions:
 
 - `Application.bringApplicationToFront()`
 - `Host.getAvailableScreen()`
@@ -159,24 +148,18 @@ class MyNewInstance(Application):
 ```
 
 `__init__` takes the Host and nothing else, because that is the signature every
-front end constructs against: `--module` imports the named module, takes the
-first `Application` subclass it defines, and calls `ApplicationClass(host)`.
+front end constructs against: `--module` imports the named module, finds the
+one concrete `Application` subclass in it, and calls `ApplicationClass(host)`.
 Configuration of its own therefore has to arrive some other way -- the download
 example parses its own command line before the Host is built.
 
 `getOutputData()` is called from inside the `notifyOutputAvailable()` that
 announced the output, and never after that call returns, so an Application may
-build output on demand and drop it as soon as the call is over. There is no
-`releaseData()` in this interface to say otherwise; a Host that wants to hold
-output back, as `--stage` does, keeps it itself rather than asking again later.
+build output on demand and drop it as soon as the call is over. Nothing obliges
+an Application to produce output at all.
 
-Nothing obliges an Application to produce output at all: one that only reads
-main tags and never calls `notifyOutputAvailable()` -- the download example
-again -- is a complete Application, and skipping `getInputData()` for the
-instances it does not want is what keeps them from being pulled from Orthanc.
-
-`OrthancRC.examples.clone` is this skeleton filled in and is about as small as
-a working Application gets.
+`OrthancRC.examples.cloneimage` is this skeleton filled in and is about as small
+as a working Application gets.
 
 ## Example reference implementation
 
@@ -184,7 +167,7 @@ Command line:
 
 ```
 cd src
-python3.13 -m OrthancRC.cmdline --input ../tests/CT_small.dcm --module OrthancRC.examples.clone
+python3 -m OrthancRC.cmdline --input ../tests/CT_small.dcm --module OrthancRC.examples.cloneimage
 ```
 
 The Host and the Application are two objects in that one Python process,
@@ -192,10 +175,10 @@ calling each other's methods directly. Only the Host touches the filesystem:
 
 ```mermaid
 flowchart LR
-    subgraph proc["one python process"]
+    subgraph proc["one Python process"]
         direction LR
         H["Host<br/><small>OrthancRC.cmdline</small>"]
-        A["Application<br/><small>OrthancRC.examples.clone</small>"]
+        A["Application<br/><small>OrthancRC.examples.cloneimage</small>"]
         H -- "notifyInputAvailable()" --> A
         A -- "getInputData()" --> H
         A -- "notifyOutputAvailable()" --> H
@@ -212,7 +195,7 @@ Search an Orthanc server and pick studies in a curses list. Without `--module`
 it only prints (and optionally saves) the checked study UUIDs:
 
 ```
-python3.13 -m OrthancRC.curses --orthanc-url http://localhost:8042 \
+python3 -m OrthancRC.curses --orthanc-url http://localhost:8042 \
     --search-patient-surname doe --save-selection selection.json
 ```
 
@@ -220,13 +203,13 @@ With `--module` the selection is handed straight to an Application: an
 `OrthancHost` is built over the checked studies and the Application subclass
 found in that module is loaded, wired to the host, and fed every instance of
 every selected study. Output datasets are uploaded back into Orthanc unless
-`--no-upload` is given, and `--output-dir` also writes them to disk.
-`--tmp-dir` puts the host's temporary files somewhere chosen rather than in a
-fresh system temp directory.
+`--no-upload` is given, and `--outputdir` also writes them to disk.
+`--tmpdir` puts the host's temporary files in a directory of your choosing
+rather than a fresh system temp directory.
 
 ```
-python3.13 -m OrthancRC.curses --module OrthancRC.examples.clone \
-    --output-dir ./out --no-upload
+python3 -m OrthancRC.curses --module OrthancRC.examples.cloneimage \
+    --outputdir ./out --no-upload
 ```
 
 The module is loaded before the search runs, so a bad `--module` fails
@@ -242,8 +225,8 @@ the Application never learns where its data came from.
 sequenceDiagram
     actor User
     participant B as Browser (OrthancRC.curses)
-    participant H as Host (OrthancRC.othanc)
-    participant A as Application (OrthancRC.examples.clone)
+    participant H as Host (OrthancRC.orthanc)
+    participant A as Application (OrthancRC.examples.cloneimage)
     participant O as Orthanc server
 
     B->>O: POST /tools/find (Level: Study)
@@ -265,7 +248,7 @@ sequenceDiagram
         A->>H: notifyOutputAvailable(outputUUID, lastData)
         H->>A: getOutputData(outputUUID)
         A-->>H: cloned Dataset
-        opt --output-dir given
+        opt --outputdir given
             H->>H: write outputUUID.dcm
         end
         opt unless --no-upload
@@ -281,9 +264,10 @@ for the series that were accepted.
 
 ### Picking series
 
-`s` opens a second picker over every study that is checked, listing all their
-series as one list, so that a study can be narrowed to some of them. ENTER keeps
-the sub-selection and confirms the browse; ESC exits the selection.
+`s` opens a second picker that lists the series of every checked study in one
+list, so that a study can be narrowed to some of its series. ENTER keeps the
+sub-selection and confirms the browse; q or ESC discards the sub-selection but
+not the browse.
 
 ### The selection file
 
@@ -305,17 +289,32 @@ UIDs. An Orthanc identifier is a SHA-1 of the DICOM identity down to that level
 -- `patientID|studyUID` for a study, `patientID|studyUID|seriesUID` for a series
 -- which is Orthanc's own scheme.
 
+Loading a file rejects:
+
+- An entry that isn't shaped like an Orthanc identifier (five groups of eight
+  lowercase hex digits), such as a DICOM UID.
+- An entry listed twice.
+- A criterion that isn't one of the `--search-*` fields.
+- A criterion value that is neither a string nor null.
+
+Saving checks the file the same way first and writes nothing if it would be
+refused, so a saved file can always be loaded again.
+
 `--restore-selection` strictly restores what was selected in the UI, so you must
-give the same search criteria that was used to save the selection. The program
+give the same search criteria that were used to save the selection. The program
 exits non-zero if the file cannot be read, if the criteria differ from the saved
 ones, if a saved study is no longer among those the search matches, or if a
 saved series is no longer held by its study. A study or series that has appeared
 since the file was saved is not an error; it is simply not part of the restored
 selection.
 
-The selection file is the message of the simplest inter-process communication
-there is: a silently degraded selection is a corrupted one, and the sender would
-never find out that half of it was dropped.
+The strictness is deliberate. The selection file is the simplest form of
+inter-process communication there is: a silently degraded selection is a
+corrupted one, and the sender would never find out that half of it was dropped.
+
+A run exits non-zero if the host reported an `ERROR` at any point, even when the
+Application accepted every input. That covers a study that couldn't be read, a
+failed download and a failed upload.
 
 ### Reviewing output before it is written: `--stage`
 
@@ -323,24 +322,24 @@ never find out that half of it was dropped.
 series it produced has been confirmed:
 
 ```
-python3.13 -m OrthancRC.curses --module OrthancRC.examples.clone \
-    --stage --output-dir ./out
+python3 -m OrthancRC.curses --module OrthancRC.examples.cloneimage \
+    --stage --outputdir ./out
 ```
 
 Each series is accepted or rejected on its own, and only the accepted ones are
-written to `--output-dir` and uploaded to Orthanc. There is no cancel on that
+written to `--outputdir` and uploaded to Orthanc. There is no cancel on that
 screen, because the run is already over.
 
 Encoded output is kept in memory up to `--output-cache` (a byte count with an
-optional `K`/`M`/`G` suffix, default `128M`) and spilled to a file in the
-host's temporary directory past that, deleted at the end of the review whether
-its series was accepted or rejected.
+optional `K`/`M`/`G` suffix, default `128M`). Anything beyond that is spilled
+to files in the host's temporary directory, which are deleted at the end of the
+review whether their series was accepted or rejected.
 
 ### Prefetching input
 
 Instances are downloaded ahead of the Application on a small thread pool, so
 that the next one is usually already in hand when it is asked for.
-`OrthancHost(..., prefetchDepth=N)` sets how many run ahead -- 2 by default,
+`OrthancHost(..., prefetchDepth=N)` sets how many run ahead -- 2 by default;
 `0` waits for each download at the moment it is asked for. The pool never has
 more than four workers; a deeper window simply queues.
 
@@ -348,16 +347,6 @@ The window follows the Application's claims, not the order inputs are offered
 in: an Application that filters on main tags -- as the download example does --
 never asks for the data of most instances, and fetching those anyway would pull
 the whole selection over just to throw it away.
-
-
-### Using the Host directly
-
-The Host itself is not part of the terminal front end: `OrthancHost` lives in
-`OrthancRC.orthanc` and knows only a list of study UUIDs -- and, optionally,
-which series to take from each -- so anything can pick them.
-`OrthancHost.fromSelectionFile()` builds one from a saved selection, and
-`OrthancRC.curses.browser.host_from_browser()` is the whole picker as a single
-call for a caller that wants a ready-made Host rather than a command line.
 
 ## Download example application
 
@@ -370,7 +359,7 @@ criterion left unset matches every series, so with none of them the whole
 selection is downloaded into `--target-folder`:
 
 ```
-python3.13 -m OrthancRC.examples.download \
+python3 -m OrthancRC.examples.download \
     --from-selection-file selection.json \
     --match-modality CT --match-series-description head \
     --target-folder ./series
@@ -380,7 +369,7 @@ python3.13 -m OrthancRC.examples.download \
 SeriesInstanceUID, rather than describing it:
 
 ```
-python3.13 -m OrthancRC.examples.download \
+python3 -m OrthancRC.examples.download \
     --from-selection-file selection.json \
     --match-series-instance-uid 1.2.840.113619.2.55.3.604688.1 \
     --target-folder ./series
@@ -389,8 +378,16 @@ python3.13 -m OrthancRC.examples.download \
 The instances of the matching series are written straight into the target
 folder as `<SOPInstanceUID>.dcm`. If more than one series matches, the second
 goes to `<target-folder>-1`, the third to `<target-folder>-2`, and so on.
-Instances of non-matching series are filtered so they are never pulled from
-Orthanc.
+Instances of non-matching series are filtered out on their main tags, so they
+are never pulled from Orthanc.
+
+Existing files are never overwritten. An instance whose file is already there
+counts as failed and is reported, and a folder that isn't empty gets a warning
+before anything is added to it.
+
+The selection is restored strictly, as the browser restores one. If a saved
+study can't be read, or a saved series has gone, the run stops before anything
+is downloaded. Any error reported during the run gives a non-zero exit.
 
 While it works, the download reports how far it has got on standard error: a bar
 rewritten in place on a terminal, a line every 10% anywhere else. The rate counts
@@ -407,6 +404,34 @@ This application can equally be driven from the browser with
 `--module OrthancRC.examples.download`, which then downloads every selected
 instance into the host's temporary directory.
 
+## Series clone example application
+
+`OrthancRC.examples.cloneseries` clones whole series rather than single
+instances. Where `OrthancRC.examples.cloneimage` gives each copy a fresh
+SOPInstanceUID and leaves it in its original series, this one moves the copies
+into a series of their own.
+
+It has its own command line, built on `OrthancRC.cmdline`: it accepts the same
+`--input`, `--inputlist`, `--outputdir` and `--tmpdir` options, and adds
+`--suffix`:
+
+```
+python3 -m OrthancRC.examples.cloneseries --input ../tests/CT_small.dcm \
+    --outputdir ./out --suffix " RECON"
+```
+
+You can also load it with `--module`, from the command-line host or the
+browser. That always uses the default suffix, because `--module` can only pass
+the Application its Host:
+
+```
+python3 -m OrthancRC.cmdline --input ../tests/CT_small.dcm --module OrthancRC.examples.cloneseries
+python3 -m OrthancRC.curses --module OrthancRC.examples.cloneseries --stage
+```
+
+Each run draws new UIDs, so cloning the same series twice gives two separate
+series.
+
 ## Testing
 
 The tests exercise the Orthanc host and the example Applications, so they need
@@ -414,5 +439,5 @@ the `orthanc` extra installed (see [Installing](#installing)):
 
 ```
 python3 -m pip install -e '.[orthanc]'
-python3.13 -m unittest discover -s tests -t tests
+python3 -m unittest discover -s tests -t tests
 ```

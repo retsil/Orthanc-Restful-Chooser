@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from OrthancRC.base import Application  # noqa: E402
 from OrthancRC import studies  # noqa: E402
+from OrthancRC.orthanc_util import seriesUUID, studyUUID  # noqa: E402
 from OrthancRC.selection import SEARCH_FIELDS  # noqa: E402
 from OrthancRC.orthanc.staging import StagedSeries  # noqa: E402
 from OrthancRC.curses import browser  # noqa: E402
@@ -58,6 +59,8 @@ class FakeHost:
         self.app = None
         self.sendResult = sendResult
         self.sent = False
+        # What main() reads to decide whether the run reported an error.
+        self.messages: list = []
 
     def setApplication(self, app) -> None:
         self.app = app
@@ -199,7 +202,7 @@ class TestMainWithModule(unittest.TestCase):
 
     def test_output_dir_and_no_upload_reach_the_host(self):
         _code, _orthanc, hostClass, _host = self._run(
-            ["--module", "fake_app", "--output-dir", "/tmp/out", "--no-upload"],
+            ["--module", "fake_app", "--outputdir", "/tmp/out", "--no-upload"],
             selected={"s1", "s2"},
         )
 
@@ -658,11 +661,20 @@ class StageTableTest(unittest.TestCase):
             self.assertNotIn("q/ESC", screen.frames[0][23])
 
 
+# A selection file holds Orthanc identifiers and refuses anything else, so
+# the studies and series that go through one are named the way Orthanc does.
+S1 = studyUUID("PID", "1.2.s1")
+S2 = studyUUID("PID", "1.2.s2")
+A1 = seriesUUID("PID", "1.2.s1", "1.2.a1")
+A2 = seriesUUID("PID", "1.2.s1", "1.2.a2")
+GONE = seriesUUID("PID", "1.2.s1", "1.2.gone")
+
+
 class MainSelectionFileTest(unittest.TestCase):
     """--save-selection and --restore-selection, through main()."""
 
     def _main(self, argv, picked=None, records=None, byStudy=None):
-        records = records if records is not None else [_record("s1"), _record("s2")]
+        records = records if records is not None else [_record(S1), _record(S2)]
         source = FakeSeriesSource(byStudy if byStudy is not None else {})
         err = io.StringIO()
         with (
@@ -683,27 +695,27 @@ class MainSelectionFileTest(unittest.TestCase):
 
             code, _wrapper, _source, err = self._main(
                 ["--save-selection", path],
-                picked=({"s1", "s2"}, {"s1": {"a1"}}),
+                picked=({S1, S2}, {S1: {A1}}),
             )
             self.assertEqual(code, 0)
             self.assertIn("2 study UUID(s) and 1 series UUID(s)", err)
 
             code, wrapper, _source, _err = self._main(
                 ["--restore-selection", path],
-                picked=({"s1"}, {}),
-                byStudy={"s1": [_series("a1"), _series("a2")]},
+                picked=({S1}, {}),
+                byStudy={S1: [_series(A1, study=S1), _series(A2, study=S1)]},
             )
 
         self.assertEqual(code, 0)
         # Both halves are pre-checked in the picker.
-        self.assertEqual(wrapper.call_args[0][2], {"s1", "s2"})
-        self.assertEqual(wrapper.call_args[0][3], {"s1": {"a1"}})
+        self.assertEqual(wrapper.call_args[0][2], {S1, S2})
+        self.assertEqual(wrapper.call_args[0][3], {S1: {A1}})
 
     def test_a_study_only_save_writes_the_file_it_always_wrote(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "selection.json"
             code, _wrapper, _source, err = self._main(
-                ["--save-selection", str(path)], picked=({"s1"}, {}))
+                ["--save-selection", str(path)], picked=({S1}, {}))
 
             data = json.loads(path.read_text())
 
@@ -716,13 +728,13 @@ class MainSelectionFileTest(unittest.TestCase):
             path = Path(folder) / "selection.json"
             path.write_text(json.dumps({
                 "criteria": {field.key: None for field in SEARCH_FIELDS},
-                "study_uids": ["s1"],
+                "study_uids": [S1],
             }))
             code, wrapper, source, _err = self._main(
-                ["--restore-selection", str(path)], picked=({"s1"}, {}))
+                ["--restore-selection", str(path)], picked=({S1}, {}))
 
         self.assertEqual(code, 0)
-        self.assertEqual(wrapper.call_args[0][2], {"s1"})
+        self.assertEqual(wrapper.call_args[0][2], {S1})
         self.assertEqual(wrapper.call_args[0][3], {})
         # Nothing to validate, so no study is listed at start up.
         self.assertEqual(source.seen, set())
@@ -733,19 +745,19 @@ class MainSelectionFileTest(unittest.TestCase):
             path.write_text(json.dumps({
                 "criteria": {field.key: None for field in SEARCH_FIELDS},
                 "selection_level": "series",
-                "study_uids": ["s1"],
-                "series_uids": {"s1": ["a1", "gone"]},
+                "study_uids": [S1],
+                "series_uids": {S1: [A1, GONE]},
             }))
             code, wrapper, _source, err = self._main(
                 ["--restore-selection", str(path)],
-                byStudy={"s1": [_series("a1")]},
+                byStudy={S1: [_series(A1, study=S1)]},
             )
 
         # Strict, and machine readable: the far end of an IPC channel cannot
         # answer a prompt.
         self.assertEqual(code, 1)
         self.assertIn("no longer hold", err)
-        self.assertIn("study s1", err)
+        self.assertIn(f"study {S1}", err)
         wrapper.assert_not_called()
 
     def test_a_contradictory_file_is_refused_before_anything_is_fetched(self):
@@ -754,8 +766,8 @@ class MainSelectionFileTest(unittest.TestCase):
             path.write_text(json.dumps({
                 "criteria": {field.key: None for field in SEARCH_FIELDS},
                 "selection_level": "study",
-                "study_uids": ["s1"],
-                "series_uids": {"s1": ["a1"]},
+                "study_uids": [S1],
+                "series_uids": {S1: [A1]},
             }))
             code, wrapper, _source, err = self._main(
                 ["--restore-selection", str(path)])
@@ -768,7 +780,7 @@ class MainSelectionFileTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "selection.json"
             path.write_text(json.dumps(
-                {"criteria": {"patient_id": "OTHER"}, "study_uids": ["s1"]}))
+                {"criteria": {"patient_id": "OTHER"}, "study_uids": [S1]}))
             code, wrapper, _source, err = self._main(
                 ["--restore-selection", str(path)])
 

@@ -44,7 +44,10 @@ its caller a different set of instances than the sender described.
 import argparse
 import dataclasses
 import json
+from datetime import datetime
 from typing import Callable, Dict, Optional, Set, Tuple
+
+from .orthanc_util import isOrthancID
 
 DATE_HELP = "YYYYMMDD or YYYY-MM-DD"
 
@@ -56,6 +59,11 @@ def normalize_date(value: Optional[str]) -> Optional[str]:
     digits = value.replace("-", "")
     if len(digits) != 8 or not digits.isdigit():
         raise ValueError(f"Invalid date {value!r}, expected YYYYMMDD or YYYY-MM-DD")
+    try:
+        # Eight digits are not yet a date: 20241399 would match nothing.
+        datetime.strptime(digits, "%Y%m%d")
+    except ValueError:
+        raise ValueError(f"Invalid date {value!r}, no such day") from None
     return digits
 
 
@@ -122,11 +130,18 @@ def add_search_arguments(parser: argparse.ArgumentParser) -> None:
 
 def build_criteria(args: argparse.Namespace) -> Dict[str, Optional[str]]:
     """Collect the --search-* options parsed into `args` into a criteria dict."""
-    return {
+    criteria = {
         field.key: (normalize_date(getattr(args, field.dest)) if field.is_date
                     else getattr(args, field.dest))
         for field in SEARCH_FIELDS
     }
+    after, before = criteria["study_after"], criteria["study_before"]
+    if after is not None and before is not None and after > before:
+        # Otherwise "no studies matched", which blames the archive.
+        raise ValueError(
+            f"--search-study-after {after} is later than "
+            f"--search-study-before {before}, so nothing can match")
+    return criteria
 
 
 STUDY_LEVEL = "study"
@@ -209,11 +224,16 @@ def save_selection(
     save_selection(path, selection) and save_selection(path, criteria, uids)
     are both accepted; the second grows an optional {study UUID: series UUIDs}
     third argument for a sub-selection.
+
+    Raises ValueError, and writes nothing, for a selection load_selection()
+    would refuse: a file is only worth writing if it can be read back.
     """
     selection = criteria if isinstance(criteria, Selection) else Selection.of(
         criteria, uids or set(), series)
+    text = json.dumps(selection.asJSONData(), indent=2)
+    load_selection_json(text)
     with open(path, "w") as f:
-        json.dump(selection.asJSONData(), f, indent=2)
+        f.write(text)
 
 
 def load_selection(path: str) -> Selection:
@@ -243,6 +263,14 @@ def load_selection_json(text: str) -> Selection:
     criteria = data.get("criteria", {})
     if not isinstance(criteria, dict):
         raise ValueError("selection 'criteria' is not an object")
+    unknownKeys = sorted(set(criteria) - {field.key for field in SEARCH_FIELDS})
+    if unknownKeys:
+        raise ValueError(f"selection 'criteria' has unknown keys {unknownKeys}")
+    notText = sorted(key for key, value in criteria.items()
+                     if value is not None and not isinstance(value, str))
+    if notText:
+        raise ValueError(
+            f"selection 'criteria' values for {notText} are neither a string nor null")
 
     studyUIDs = _uidList(data.get("study_uids", []), "study_uids")
 
@@ -305,11 +333,19 @@ def load_selection_json(text: str) -> Selection:
 def check_criteria(selection: Selection, criteria: Dict[str, Optional[str]]) -> None:
     """Raise unless the selection was made under the criteria in force now."""
     if selection.criteria != criteria:
+        # A key absent on one side differs from one that is null, as it does
+        # in the comparison above, so the two are told apart here as well.
+        absent = object()
+        differing = sorted(
+            key for key in set(selection.criteria) | set(criteria)
+            if selection.criteria.get(key, absent) != criteria.get(key, absent))
+        detail = "\n".join(
+            f"  {key}: saved {selection.criteria.get(key, '(absent)')!r}, "
+            f"current {criteria.get(key, '(absent)')!r}"
+            for key in differing)
         raise ValueError(
             "saved selection's search criteria do not match the criteria "
-            "given on the command line\n"
-            f"  saved:   {selection.criteria}\n"
-            f"  current: {criteria}")
+            f"given on the command line:\n{detail}")
 
 
 def check_studies(selection: Selection, matched: Set[str]) -> None:
@@ -351,4 +387,15 @@ def _uidList(value: object, what: str) -> Set[str]:
     """One of the file's UUID lists, as a set."""
     if not isinstance(value, list) or not all(isinstance(uid, str) for uid in value):
         raise ValueError(f"selection '{what}' is not a list of strings")
-    return set(value)
+    # DICOM UIDs would pass as strings and fail much later as "no longer has
+    # selected series", which sends people to the archive instead of the file.
+    malformed = sorted(uid for uid in value if not isOrthancID(uid))
+    if malformed:
+        raise ValueError(
+            f"selection '{what}' holds entries that are not Orthanc "
+            f"identifiers: {malformed}")
+    uids = set(value)
+    if len(uids) != len(value):
+        repeated = sorted(uid for uid in uids if value.count(uid) > 1)
+        raise ValueError(f"selection '{what}' lists {repeated} more than once")
+    return uids

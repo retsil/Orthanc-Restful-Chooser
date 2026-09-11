@@ -37,6 +37,8 @@ Orthanc (and/or written to disk).
 import io
 import sys
 import tempfile
+import threading
+from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set
@@ -47,8 +49,8 @@ from pydicom.uid import generate_uid
 from pyorthanc import Orthanc
 
 from ..base import Application, Host
-from ..enums import State, Status
-from ..orthanc_util import asNumber
+from ..enums import State, Status, asEnum
+from ..orthanc_util import asNumber, outputProblems
 from ..selection import load_selection
 
 
@@ -65,6 +67,9 @@ class OrthancHost(Host):
         uploadOutputs: bool = True,
         prefetchDepth: int = 2,
     ) -> None:
+        # Every (Status, text) reported so far, for a UI to display. First, so
+        # that the checks on the arguments below have somewhere to report to.
+        self.messages: List[tuple] = []
         self._client = client
         self._studyUUIDs = list(studyUUIDs)
         # {study UUID: the series wanted from it}. A study missing from this
@@ -74,6 +79,21 @@ class OrthancHost(Host):
         self._seriesUUIDs: Dict[str, Set[str]] = {
             study: set(wanted) for study, wanted in (seriesUUIDs or {}).items()
         }
+        # Each of these is accepted, but none of them is what a caller meant,
+        # and each ends with a study contributing nothing or being read twice.
+        # load_selection() refuses the first two outright.
+        repeated = sorted(uuid for uuid, n in Counter(self._studyUUIDs).items() if n > 1)
+        if repeated:
+            self.notifyStatus(Status.WARNING, f"studies selected more than once: {repeated}")
+        unselected = sorted(set(self._seriesUUIDs) - set(self._studyUUIDs))
+        if unselected:
+            self.notifyStatus(
+                Status.WARNING, f"series given for studies that are not selected, "
+                                f"so ignored: {unselected}")
+        emptied = sorted(study for study, wanted in self._seriesUUIDs.items() if not wanted)
+        if emptied:
+            self.notifyStatus(
+                Status.WARNING, f"studies narrowed to no series at all: {emptied}")
         self._outputDir = outputDir
         if self._outputDir is not None:
             self._outputDir.mkdir(parents=True, exist_ok=True)
@@ -100,8 +120,18 @@ class OrthancHost(Host):
         # claim can find what comes after it without walking the dict.
         self._order: List[str] = []
         self._positions: Dict[str, int] = {}
-        # Every (Status, text) reported so far, for a UI to display.
-        self.messages: List[tuple] = []
+        # The patients and studies the inputs belong to, filled in with the
+        # instances, so that an output naming neither can be pointed out.
+        self._patientIDs: Set[str] = set()
+        self._studyUIDs: Set[str] = set()
+        # Output UUIDs taken this run; every sink is named after them.
+        self._announced: Set[str] = set()
+        # The thread sendInputs() is running the Application on, and whether
+        # it has returned, to hold _pending to the promise made above.
+        self._runThread: Optional[int] = None
+        self._runOver = False
+        self._warnedThread = False
+        self._warnedAfterRun = False
 
     # -- construction from a saved selection ------------------------------
 
@@ -143,7 +173,11 @@ class OrthancHost(Host):
 
     def getMainTags(self, instanceUUID: str) -> Dict[str, object]:
         """Patient, study, series and instance main tags for one instance."""
-        return dict(self._loadInstances().get(instanceUUID, {}))
+        instances = self._loadInstances()
+        if instanceUUID not in instances:
+            self.notifyStatus(Status.ERROR, f"{instanceUUID} is not a selected instance")
+            return {}
+        return dict(instances[instanceUUID])
 
     def setApplication(self, app: Application) -> None:
         self._app = app
@@ -167,6 +201,8 @@ class OrthancHost(Host):
             self.notifyStatus(Status.WARNING, "selection contains no instances")
             return False
 
+        self._runThread = threading.get_ident()
+        self._runOver = False
         try:
             for i, uuid in enumerate(uuids):
                 lastData = i == len(uuids) - 1
@@ -180,6 +216,7 @@ class OrthancHost(Host):
                     return False
             return True
         finally:
+            self._runOver = True
             self.close()
 
     def close(self) -> None:
@@ -209,7 +246,9 @@ class OrthancHost(Host):
         return str(generate_uid())
 
     def getInputData(self, instanceUUID: str) -> Dataset:
-        if instanceUUID not in self._loadInstances():
+        self._checkCallingThread()
+        instances = self._loadInstances()
+        if instanceUUID not in instances:
             self.notifyStatus(Status.ERROR, f"{instanceUUID} is not a selected instance")
             return Dataset()
 
@@ -218,13 +257,27 @@ class OrthancHost(Host):
         self._prefetch(self._nextInstances(instanceUUID))
         running = self._pending.pop(instanceUUID, None)
         try:
-            return running.result() if running is not None else self._download(instanceUUID)
+            ds = running.result() if running is not None else self._download(instanceUUID)
         except Exception as exc:  # noqa: BLE001 - surface any HTTP error plainly
             # Reported here rather than where it was raised: a download that
             # failed ahead of time is only the Application's problem once it
             # asks for the data, and one it never asks for is nobody's.
             self.notifyStatus(Status.ERROR, f"could not download {instanceUUID}: {exc}")
             return Dataset()
+
+        # The Application has already acted on the main tags, so a file that
+        # is not the instance they describe is refused like a failed download
+        # rather than handed over as if it were.
+        listed = instances[instanceUUID]
+        for keyword in ("SOPInstanceUID", "SeriesInstanceUID"):
+            expected = str(listed.get(keyword, ""))
+            received = str(ds.get(keyword, ""))
+            if expected and received != expected:
+                self.notifyStatus(
+                    Status.ERROR, f"downloaded {instanceUUID} is not the instance "
+                                  f"listed: {keyword} {received!r}, expected {expected!r}")
+                return Dataset()
+        return ds
 
     def notifyOutputAvailable(self, instanceUUID: str, lastData: bool) -> bool:
         if self._app is None:
@@ -246,13 +299,25 @@ class OrthancHost(Host):
         caller holding output should keep: it is what `storeOutput` takes, it
         is a fraction of the object graph pydicom keeps for the same instance,
         and its length is a number, where a Dataset's footprint is a guess.
+
+        Every output announced goes through here exactly once, staged or not,
+        so this is also where it is checked (see outputProblems): an output
+        announced twice, or one that is an input unchanged, is refused.
         """
+        problems = outputProblems(ds, instanceUUID, self._instances or {},
+                                  self._announced, self._patientIDs, self._studyUIDs)
+        for status, text in problems:
+            self.notifyStatus(status, text)
+        if any(status is Status.ERROR for status, _text in problems):
+            return None
+
         buffer = io.BytesIO()
         try:
             pydicom.dcmwrite(buffer, ds, enforce_file_format=True)
         except Exception as exc:  # noqa: BLE001 - an unwritable dataset is the app's bug
             self.notifyStatus(Status.ERROR, f"could not encode output {instanceUUID}: {exc}")
             return None
+        self._announced.add(instanceUUID)
         return buffer.getvalue()
 
     def storeOutput(self, instanceUUID: str, data: bytes) -> bool:
@@ -267,6 +332,10 @@ class OrthancHost(Host):
         """
         if self._outputDir is not None:
             outPath = self._outputDir / f"{instanceUUID}.dcm"
+            if outPath.exists():
+                # Repeats within a run are refused before this; this is a file
+                # left by an earlier run into the same directory.
+                self.notifyStatus(Status.WARNING, f"overwriting {outPath}")
             outPath.write_bytes(data)
             self.notifyStatus(Status.INFORMATION, f"wrote {outPath}")
 
@@ -276,19 +345,60 @@ class OrthancHost(Host):
             except Exception as exc:  # noqa: BLE001 - surface any HTTP error plainly
                 self.notifyStatus(Status.ERROR, f"could not upload output {instanceUUID}: {exc}")
                 return False
-            storedUUID = stored.get("ID", "") if isinstance(stored, dict) else ""
-            self.notifyStatus(Status.INFORMATION, f"uploaded output as {storedUUID or 'unknown UUID'}")
+            reply = stored if isinstance(stored, dict) else {}
+            storedUUID = reply.get("ID", "") or "unknown UUID"
+            status = reply.get("Status")
+            if status is not None and status != "Success":
+                # AlreadyStored and the like: Orthanc answered, but nothing
+                # new is in the archive, which "uploaded" would not say.
+                self.notifyStatus(
+                    Status.WARNING, f"Orthanc stored nothing new for output "
+                                    f"{instanceUUID}: {status} ({storedUUID})")
+            else:
+                self.notifyStatus(Status.INFORMATION, f"uploaded output as {storedUUID}")
 
         return True
 
     def notifyStateChanged(self, value: State) -> None:
-        print(f"[state] {value.name}", file=sys.stderr)
+        state, problem = asEnum(State, value)
+        if problem is not None:
+            self.notifyStatus(Status.WARNING if state is not None else Status.ERROR, problem)
+        if state is not None:
+            print(f"[state] {state.name}", file=sys.stderr)
 
     def notifyStatus(self, value: Status, text: str) -> None:
-        self.messages.append((value, text))
-        print(f"[{value.name}] {text}", file=sys.stderr)
+        status, problem = asEnum(Status, value)
+        # The message is kept whatever it was sent as: an unknown level is
+        # recorded as an error, so it can neither vanish nor pass as benign.
+        # Not `status or ERROR`: INFORMATION is 0.
+        level = status if status is not None else Status.ERROR
+        self.messages.append((level, text))
+        print(f"[{level.name}] {text}", file=sys.stderr)
+        if problem is not None:
+            self.notifyStatus(Status.WARNING if status is not None else Status.ERROR, problem)
 
     # -- internals ---------------------------------------------------------
+
+    def _checkCallingThread(self) -> None:
+        """Report, once each, data asked for off the run's thread or after it.
+
+        Either one breaks what _pending relies on: another thread races on
+        it, and a call after the run starts a pool nothing will shut down.
+        Before any run there is nothing to hold a caller to.
+        """
+        if self._runThread is None:
+            return
+        if self._runOver:
+            if not self._warnedAfterRun:
+                self._warnedAfterRun = True
+                self.notifyStatus(
+                    Status.WARNING, "input data asked for after sendInputs() "
+                                    "returned; call close() when done with it")
+        elif threading.get_ident() != self._runThread and not self._warnedThread:
+            self._warnedThread = True
+            self.notifyStatus(
+                Status.WARNING, "input data asked for from a thread other than "
+                                "the one sendInputs() is running on")
 
     def _download(self, instanceUUID: str) -> Dataset:
         """Fetch and parse one instance; runs on a prefetch thread.
@@ -365,14 +475,41 @@ class OrthancHost(Host):
                 self.notifyStatus(Status.ERROR, f"could not read study {studyUUID}: {exc}")
                 continue
 
+            if study.get("IsStable") is False:
+                self.notifyStatus(
+                    Status.WARNING, f"study {studyUUID} is still receiving "
+                                    "instances; this run may miss some of them")
+
             studyTags = {
                 **study.get("PatientMainDicomTags", {}),
                 **study.get("MainDicomTags", {}),
             }
+            if "PatientID" in studyTags:
+                self._patientIDs.add(str(studyTags["PatientID"]))
+            if "StudyInstanceUID" in studyTags:
+                self._studyUIDs.add(str(studyTags["StudyInstanceUID"]))
             seriesTags = {
                 entry["ID"]: entry.get("MainDicomTags", {})
                 for entry in seriesEntries
             }
+
+            # The two listings are separate requests, so the archive can change
+            # between them; they are compared here, where both are in hand.
+            listed = Counter(entry.get("ParentSeries", "") for entry in instanceEntries)
+            for entry in seriesEntries:
+                held = entry.get("Instances")
+                if held is not None and len(held) != listed[entry["ID"]]:
+                    self.notifyStatus(
+                        Status.WARNING, f"series {entry['ID']} of study {studyUUID} "
+                                        f"holds {len(held)} instance(s) but "
+                                        f"{listed[entry['ID']]} were listed; it "
+                                        "changed while being read")
+            orphans = sorted(set(listed) - set(seriesTags))
+            if orphans:
+                # Still offered, with only the study's tags, and sorted last.
+                self.notifyStatus(
+                    Status.WARNING, f"study {studyUUID} lists instances of series "
+                                    f"it does not list: {orphans}")
             # None here means the whole study, so no test is made at all; a
             # narrowed study is filtered on ParentSeries, which *is* the
             # Orthanc series identifier the selection holds, so the test is
@@ -394,6 +531,7 @@ class OrthancHost(Host):
             # they were selected in, which the loop above already gives.
             ordered = sorted(instanceEntries,
                              key=lambda entry: self._instanceOrder(entry, seriesTags))
+            contributed = 0
             for entry in ordered:
                 if wanted is not None and entry.get("ParentSeries", "") not in wanted:
                     continue
@@ -402,6 +540,10 @@ class OrthancHost(Host):
                     **seriesTags.get(entry.get("ParentSeries", ""), {}),
                     **entry.get("MainDicomTags", {}),
                 }
+                contributed += 1
+            if not contributed:
+                self.notifyStatus(
+                    Status.WARNING, f"study {studyUUID} contributes no instances")
 
         self._instances = instances
         self._order = list(instances)

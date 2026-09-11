@@ -27,7 +27,7 @@ from OrthancRC.cmdline import (  # noqa: E402
     loadApplicationClass,
 )
 from OrthancRC.orthanc_util import extractMainTags, instanceUUIDFor  # noqa: E402
-from OrthancRC.examples.clone import CloneInstances  # noqa: E402
+from OrthancRC.examples.cloneimage import CloneInstances  # noqa: E402
 
 DATA_FILE = Path(__file__).resolve().parent / "CT_small.dcm"
 
@@ -81,7 +81,7 @@ class TestExtractMainTags(unittest.TestCase):
 
 class TestLoadApplicationClass(unittest.TestCase):
     def test_loads_subclass_from_module(self):
-        cls = loadApplicationClass("OrthancRC.examples.clone")
+        cls = loadApplicationClass("OrthancRC.examples.cloneimage")
         self.assertIs(cls, CloneInstances)
 
     def test_module_without_application_raises(self):

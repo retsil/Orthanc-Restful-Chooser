@@ -28,15 +28,29 @@ from ...enums import (
 _MODULE_DIR = Path(__file__).resolve().parent
 
 
+def cloneInstance(source: Dataset, sopInstanceUID: str) -> Dataset:
+    """A deep copy of source under a new SOP Instance UID.
+
+    The file meta carries the same UID and must be kept in step with it; a
+    dataset built in memory rather than read from a file has no file meta.
+    """
+    ds = copy.deepcopy(source)
+    ds.SOPInstanceUID = sopInstanceUID
+    if getattr(ds, "file_meta", None) is not None:
+        ds.file_meta.MediaStorageSOPInstanceUID = sopInstanceUID
+    return ds
+
+
 class CloneInstances(Application):
     """A minimal Application: clones each input instance under a fresh UID."""
     __version__=1.0
-    __icon__=str(_MODULE_DIR / "clone-icon.png")
+    __icon__=str(_MODULE_DIR / "cloneimage-icon.png")
     __description__="A minimal Application: clones each input instance under a fresh UID."
 
     def __init__(self, host: Host) -> None:
         self._host = host
         self._outputs: dict[str, Dataset] = {}
+        self._refused = 0
         self._host.notifyStateChanged(State.IDLE)
 
     def getOutputData(self, instanceUUID: str) -> Dataset:
@@ -48,16 +62,18 @@ class CloneInstances(Application):
 
         # Trivial "processing": copy the input dataset and give it a fresh
         # SOP Instance UID obtained from the host.
-        ds = copy.deepcopy(self._host.getInputData(instanceUUID))
-        newSopUID = self._host.generateUID()
-        ds.SOPInstanceUID = newSopUID
-        if getattr(ds, "file_meta", None) is not None:
-            ds.file_meta.MediaStorageSOPInstanceUID = newSopUID
+        ds = cloneInstance(self._host.getInputData(instanceUUID), self._host.generateUID())
         outputUUID = instanceUUIDFor(ds)
         self._outputs[outputUUID] = ds
-        self._host.notifyOutputAvailable(outputUUID, lastData)
+        # False is the host saying it could not take the output: the reason
+        # is in its own status, but it should not look like success here.
+        if not self._host.notifyOutputAvailable(outputUUID, lastData):
+            self._refused += 1
 
         if lastData:
+            if self._refused:
+                self._host.notifyStatus(
+                    Status.WARNING, f"the host did not take {self._refused} output(s)")
             self._host.notifyStateChanged(State.COMPLETED)
         return True
 

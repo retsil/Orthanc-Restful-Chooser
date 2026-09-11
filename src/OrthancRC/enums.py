@@ -33,3 +33,21 @@ class Status(IntEnum):
     FATALERROR = 3
 
 
+def asEnum(kind: type[IntEnum], value: object) -> tuple[IntEnum | None, str | None]:
+    """value as a member of kind, and what was wrong with it if anything.
+
+    An Application written against the WG23 numbers may pass a bare int, which
+    has no .name for a Host to print. A number in range is converted and
+    reported; one out of range comes back as None, for the Host to report as
+    an error rather than raise inside the Application's call.
+    """
+    if isinstance(value, kind):
+        return value, None
+    try:
+        member = kind(value)
+    except ValueError:
+        return None, f"{value!r} is not a {kind.__name__}"
+    return member, (f"{kind.__name__} passed as bare {value!r}; "
+                    f"use {kind.__name__}.{member.name}")
+
+

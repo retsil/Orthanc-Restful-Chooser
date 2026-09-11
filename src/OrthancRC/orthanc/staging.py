@@ -156,6 +156,8 @@ class StagingHost(Host):
         # Rows in the order their first instance arrived, which is the order
         # the run produced them in.
         self._series: Dict[str, StagedSeries] = {}
+        # Rows already reported for instances that disagree with the first.
+        self._mixedRows: Set[str] = set()
         self._heldBytes = 0
         self._spilledBytes = 0
         self._spillDir: Optional[Path] = None
@@ -193,6 +195,20 @@ class StagingHost(Host):
         if unknown:
             self.notifyStatus(
                 Status.ERROR, f"no staged output series {unknown}")
+
+        # The totals are kept in four places; the summary below and the table
+        # a user just confirmed are only right if they still agree.
+        stagedBytes = sum(item.size for item in self._staged)
+        rowBytes = sum(row.byteCount for row in self._series.values())
+        rowInstances = sum(row.instanceCount for row in self._series.values())
+        if not (self._heldBytes + self._spilledBytes == stagedBytes == rowBytes
+                and len(self._staged) == rowInstances):
+            self.notifyStatus(
+                Status.ERROR, "staged output totals disagree: "
+                              f"{self._heldBytes}+{self._spilledBytes} byte(s) "
+                              f"held+spilled, {stagedBytes} staged, {rowBytes} "
+                              f"in the table; {len(self._staged)} instance(s) "
+                              f"staged, {rowInstances} in the table")
 
         self.notifyStatus(
             Status.INFORMATION,
@@ -240,12 +256,22 @@ class StagingHost(Host):
             staged.drop()
         self._staged = []
         self._series = {}
+        self._mixedRows = set()
         self._heldBytes = 0
         self._spilledBytes = 0
         if self._spillDir is not None:
             # Only the directory this made, and only once its files are gone;
             # the tmp dir it sits in belongs to the wrapped host.
-            self._spillDir.rmdir()
+            try:
+                self._spillDir.rmdir()
+            except OSError as exc:
+                # Raising here would hide the result of the commit this runs
+                # at the end of; what is left is patient data, so it is named.
+                left = sorted(p.name for p in self._spillDir.iterdir()) \
+                    if self._spillDir.is_dir() else []
+                self.notifyStatus(
+                    Status.ERROR, f"could not remove {self._spillDir}: {exc}; "
+                                  f"left behind: {left}")
             self._spillDir = None
 
     # -- the one call that is intercepted ---------------------------------
@@ -263,18 +289,29 @@ class StagingHost(Host):
         if data is None:
             return False
 
-        staged = _StagedInstance(
+        held: Optional[bytes] = None
+        spilled: Optional[Path] = None
+        if self._heldBytes + len(data) <= self._outputCacheBytes:
+            held = data
+            self._heldBytes += len(data)
+        else:
+            try:
+                spilled = self._spill(instanceUUID, data)
+            except OSError as exc:
+                # A full disk, say: this call's failure, not an exception
+                # thrown back through the Application.
+                self.notifyStatus(Status.ERROR, f"could not stage output {instanceUUID}: {exc}")
+                return False
+            self._spilledBytes += len(data)
+        # Counted into its row only once it is safely somewhere, so that a
+        # failed spill leaves no trace in the table.
+        self._staged.append(_StagedInstance(
             instanceUUID=instanceUUID,
             seriesKey=self._rowFor(instanceUUID, ds, len(data)),
             size=len(data),
-        )
-        if self._heldBytes + len(data) <= self._outputCacheBytes:
-            staged.data = data
-            self._heldBytes += len(data)
-        else:
-            staged.path = self._spill(instanceUUID, data)
-            self._spilledBytes += len(data)
-        self._staged.append(staged)
+            data=held,
+            path=spilled,
+        ))
         return True
 
     # -- everything else is the wrapped host ------------------------------
@@ -341,18 +378,34 @@ class StagingHost(Host):
         # reject is fine, output vanishing from the table is not.
         key = seriesUID or f"<no SeriesInstanceUID: {instanceUUID}>"
 
+        seriesNumber = str(ds.get("SeriesNumber", "") or "")
+        modality = str(ds.get("Modality", "") or "")
+        description = str(ds.get("SeriesDescription", "") or "")
         row = self._series.get(key)
         if row is None:
             self._series[key] = StagedSeries(
                 key=key,
                 seriesInstanceUID=seriesUID,
-                seriesNumber=str(ds.get("SeriesNumber", "") or ""),
-                modality=str(ds.get("Modality", "") or ""),
-                description=str(ds.get("SeriesDescription", "") or ""),
+                seriesNumber=seriesNumber,
+                modality=modality,
+                description=description,
                 instanceCount=1,
                 byteCount=size,
             )
         else:
+            # The row shows its first instance's values, so later ones that
+            # differ would be hidden from the user reviewing it.
+            if (key not in self._mixedRows
+                    and (seriesNumber, modality, description)
+                    != (row.seriesNumber, row.modality, row.description)):
+                self._mixedRows.add(key)
+                self.notifyStatus(
+                    Status.WARNING, f"output series {key} mixes instances: "
+                                    f"{instanceUUID} has number {seriesNumber!r}, "
+                                    f"modality {modality!r}, description "
+                                    f"{description!r}, where the table shows "
+                                    f"{row.seriesNumber!r}, {row.modality!r}, "
+                                    f"{row.description!r}")
             self._series[key] = dataclasses.replace(
                 row,
                 instanceCount=row.instanceCount + 1,

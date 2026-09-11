@@ -16,12 +16,18 @@
 """Loading an Application implementation named on a command line."""
 
 import importlib
+import inspect
 
 from .base import Application
 
 
 def loadApplicationClass(moduleName: str) -> type[Application]:
-    """Import moduleName and return the Application subclass it defines."""
+    """Import moduleName and return the Application subclass it defines.
+
+    Exactly one concrete subclass has to be found, or `__all__` has to narrow
+    it to one: taking the first in the module would follow import order, and a
+    module that imports an Application to build on would load that one.
+    """
     try:
         module = importlib.import_module(moduleName)
     except ImportError as exc:
@@ -34,7 +40,23 @@ def loadApplicationClass(moduleName: str) -> type[Application]:
         raise SystemExit(
             f"module {moduleName!r} failed to import: {type(exc).__name__}: {exc}"
         ) from exc
-    for obj in vars(module).values():
-        if isinstance(obj, type) and issubclass(obj, Application) and obj is not Application:
-            return obj
+    # Abstract ones are dropped, Application itself among them; a class bound
+    # to two names is still one candidate.
+    candidates = list(dict.fromkeys(
+        obj for obj in vars(module).values()
+        if isinstance(obj, type) and issubclass(obj, Application)
+        and not inspect.isabstract(obj)
+    ))
+    exported = getattr(module, "__all__", None)
+    if len(candidates) > 1 and exported is not None:
+        # Narrowed only if that leaves something; otherwise the ambiguity
+        # below is the truer report than "defines no Application subclass".
+        candidates = [obj for obj in candidates if obj.__name__ in exported] or candidates
+    if len(candidates) == 1:
+        return candidates[0]
+    if candidates:
+        names = ", ".join(sorted(obj.__name__ for obj in candidates))
+        raise SystemExit(
+            f"module {moduleName!r} holds more than one Application subclass "
+            f"({names}); name one in its __all__")
     raise SystemExit(f"module {moduleName!r} defines no Application subclass")

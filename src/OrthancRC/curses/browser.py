@@ -52,6 +52,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 from pyorthanc import Orthanc
 
 from ..base import Application, Host
+from ..enums import Status
 from ..loader import loadApplicationClass
 from ..orthanc.host import OrthancHost
 from ..orthanc.staging import (DEFAULT_OUTPUT_CACHE_BYTES, StagedSeries,
@@ -122,19 +123,19 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
              "the selected studies. Without it the browser only selects.",
     )
     parser.add_argument(
-        "--output-dir", metavar="DIR", default=None,
+        "--outputdir", metavar="DIR", default=None,
         help="Directory to also write the Application's output DICOM files "
              "into (--module only; by default outputs are only uploaded).",
     )
     parser.add_argument(
-        "--tmp-dir", metavar="DIR", default=None,
+        "--tmpdir", metavar="DIR", default=None,
         help="Directory for the host's temporary files (--module only; "
              "default: a fresh system temp dir).",
     )
     parser.add_argument(
         "--no-upload", action="store_true",
         help="Do not upload the Application's output back into Orthanc "
-             "(--module only). Pair with --output-dir to keep the results.",
+             "(--module only). Pair with --outputdir to keep the results.",
     )
     parser.add_argument(
         "--stage", action="store_true",
@@ -661,8 +662,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    if args.stage and args.no_upload and not args.output_dir:
-        print("warning: --stage with --no-upload and no --output-dir has "
+    if args.stage and args.no_upload and not args.outputdir:
+        print("warning: --stage with --no-upload and no --outputdir has "
               "nowhere to commit output to, so the review decides nothing.",
               file=sys.stderr)
 
@@ -740,7 +741,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     selected, series = picked
 
     if args.save_selection:
-        save_selection(args.save_selection, criteria, selected, series)
+        try:
+            save_selection(args.save_selection, criteria, selected, series)
+        except (OSError, ValueError) as exc:
+            # ValueError: a selection the reader would refuse, so not written.
+            print(f"error: could not save selection: {exc}", file=sys.stderr)
+            return 1
         saved = f"Saved {len(selected)} study UUID(s)"
         if series:
             saved += (f" and {sum(len(s) for s in series.values())} series "
@@ -757,13 +763,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         client,
         [r.uid for r in records if r.uid in selected],
         seriesUUIDs=series,
-        outputDir=Path(args.output_dir) if args.output_dir else None,
-        tmpDir=Path(args.tmp_dir) if args.tmp_dir else None,
+        outputDir=Path(args.outputdir) if args.outputdir else None,
+        tmpDir=Path(args.tmpdir) if args.tmpdir else None,
         uploadOutputs=not args.no_upload,
     )
     if args.stage:
-        return run_staged_application(host, application_class, outputCacheBytes)
-    return run_application(host, application_class)
+        code = run_staged_application(host, application_class, outputCacheBytes)
+    else:
+        code = run_application(host, application_class)
+    # Every input accepted is not the same as the run having worked: a study
+    # that could not be read, a failed download or upload was reported, and
+    # must not exit 0. StagingHost shares this message list.
+    if any(status in (Status.ERROR, Status.FATALERROR) for status, _text in host.messages):
+        return 1
+    return code
 
 
 if __name__ == "__main__":

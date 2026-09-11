@@ -578,9 +578,9 @@ class TestDownloadCli(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "selection.json"
-            # Parses, but says two things at once.
+            # Parses, and names a well-formed study, but says two things at once.
             path.write_text('{"criteria": {}, "selection_level": "series", '
-                            '"study_uids": ["s1"]}')
+                            '"study_uids": ["00000000-00000000-00000000-00000000-00000000"]}')
             with mock.patch.object(cli, "Orthanc"):
                 code = cli.main([
                     "--from-selection-file", str(path),

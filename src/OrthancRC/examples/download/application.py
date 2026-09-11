@@ -85,11 +85,15 @@ class DownloadSeries(Application):
         # The rate is kept whether or not there is a bar to draw it on, so
         # that the closing summary can report one even with --no-progress.
         self._rate = Rate()
+        # What the host said it would offer, and every input it did, so that
+        # the closing summary can be checked against both.
+        self._expected = countInputs(host)
+        self._offered = 0
         # Progress counts every instance offered, matching or not: it tracks
         # the way through the selection, not the number of files written; the
         # rate beside it counts only the bytes that actually arrived.
         self._progress: Optional[ProgressBar] = (
-            ProgressBar(countInputs(host), rate=self._rate) if showProgress
+            ProgressBar(self._expected, rate=self._rate) if showProgress
             else None
         )
         self._downloaded = 0
@@ -145,6 +149,7 @@ class DownloadSeries(Application):
 
     def notifyInputAvailable(self, instanceUUID: str, mainTags: dict[str, object], lastData: bool) -> bool:
         self._host.notifyStateChanged(State.INPROGRESS)
+        self._offered += 1
 
         if self._progress is not None:
             # The status lines the download reports must not be written over
@@ -162,6 +167,15 @@ class DownloadSeries(Application):
                 self._progress.finish()
 
         if lastData:
+            accounted = self._downloaded + self._skipped + self._failed
+            if accounted != self._offered or self._expected not in (0, self._offered):
+                # Each input should land in exactly one of the three counts;
+                # a host that cannot give a total reports 0 and is not held to it.
+                self._host.notifyStatus(
+                    Status.WARNING,
+                    f"the counts do not add up: {accounted} accounted for, "
+                    f"{self._offered} offered, {self._expected or 'unknown'} expected",
+                )
             rate = self._rate.format()
             self._host.notifyStatus(
                 Status.INFORMATION,
@@ -197,6 +211,12 @@ class DownloadSeries(Application):
         # it is always known here, and it is unique per instance.
         sopInstanceUID = str(mainTags.get("SOPInstanceUID", "")) or instanceUUID
         path = folder / f"{sopInstanceUID}.dcm"
+        if path.exists():
+            # Two instances sharing a SOPInstanceUID, or a rerun into the same
+            # target: either way, writing would lose a file without a word.
+            self._host.notifyStatus(Status.ERROR, f"{path} already exists, not overwritten")
+            self._failed += 1
+            return
         try:
             pydicom.dcmwrite(str(path), ds, enforce_file_format=True)
         except Exception as exc:  # noqa: BLE001 - surface any write error plainly
@@ -229,5 +249,10 @@ class DownloadSeries(Application):
             index = len(self._seriesFolders)
             folder = (self._targetFolder if index == 0
                       else Path(f"{self._targetFolder}-{index}"))
+            if folder.is_dir() and any(folder.iterdir()):
+                # An earlier run's series would be mixed in with this one's.
+                self._host.notifyStatus(
+                    Status.WARNING, f"{folder} is not empty; series "
+                                    f"{seriesUID} is being added to what is there")
             self._seriesFolders[seriesUID] = folder
         return folder

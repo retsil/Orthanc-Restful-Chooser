@@ -13,24 +13,11 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Reference command-line Host implementation."""
+"""Reference Application that clones each input series as a new series."""
 
-from .filelist import (
-    CmdLineHost,
-    addHostArguments,
-    collectInputFiles,
-    loadApplicationClass,
-    main,
-    parseArgs,
-    runApplication,
-)
+from .application import CloneSeries, DEFAULT_SUFFIX
 
 __all__ = [
-    "CmdLineHost",
-    "addHostArguments",
-    "collectInputFiles",
-    "loadApplicationClass",
-    "main",
-    "parseArgs",
-    "runApplication",
+    "CloneSeries",
+    "DEFAULT_SUFFIX",
 ]

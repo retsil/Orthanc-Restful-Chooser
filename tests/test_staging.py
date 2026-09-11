@@ -16,7 +16,6 @@
 """Output held back for review: what is staged, what is committed, and what
 is never asked of the Application."""
 
-import io
 import sys
 import tempfile
 import unittest
@@ -29,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import test_host  # noqa: E402 - the fake Orthanc client lives with the host tests
 
 from OrthancRC.enums import Status  # noqa: E402
-from OrthancRC.examples.clone.application import CloneInstances  # noqa: E402
+from OrthancRC.examples.cloneimage.application import CloneInstances  # noqa: E402
 from OrthancRC.orthanc import OrthancHost  # noqa: E402
 from OrthancRC.orthanc.staging import (DEFAULT_OUTPUT_CACHE_BYTES, StagingHost,
                                        formatByteSize, parseByteSize)  # noqa: E402
@@ -138,7 +137,11 @@ class StagingTest(unittest.TestCase):
 
     def test_an_unencodable_output_still_fails_its_own_call(self):
         staging, app = self._staging()
-        app.getOutputData = lambda uuid: pydicom.Dataset()
+        # Not empty, which is refused before encoding with a message of its
+        # own, but with nothing to say how it is to be written.
+        unencodable = pydicom.Dataset()
+        unencodable.PatientName = "Doe^Jane"
+        app.getOutputData = lambda uuid: unencodable
 
         self.assertFalse(staging.notifyOutputAvailable("i1", True))
         self.assertIn("could not encode output", staging.messages[-1][1])
@@ -243,7 +246,8 @@ class StagingTest(unittest.TestCase):
         staging.commitStagedOutputs(["1.2.1", "nonsense"])
 
         self.assertIn("no staged output series",
-                      [text for _status, text in staging.messages][0])
+                      [text for status, text in staging.messages
+                       if status == Status.ERROR][0])
         # The rows that do exist are still committed.
         self.assertEqual(self._written(), ["i1.dcm"])
 
@@ -299,7 +303,9 @@ class StagingTest(unittest.TestCase):
         # the same length.
         sizer = ForgetfulApp(None)
         sizer.series["i1"] = _tags("1.2.1")
-        one = len(self.host.encodeOutput(sizer.getOutputData("i1"), "i1"))
+        # A host of its own: encoding counts as taking the output, and the
+        # one under test would then refuse i1 as announced twice.
+        one = len(OrthancHost(FakeClient(), []).encodeOutput(sizer.getOutputData("i1"), "i1"))
 
         staging, _app = self._staging(outputCacheBytes=one)
         self._stage(staging, ("i1", "1.2.1"), ("i2", "1.2.1"))
@@ -368,23 +374,6 @@ class StagingTest(unittest.TestCase):
         self.assertEqual(self._spillFiles(), ["i1.dcm"])
 
 
-class TwoSeriesOrthanc(test_host.FakeOrthanc):
-    """The host tests' fake, serving each instance under its own series.
-
-    The shared fake stamps only SOPInstanceUID, so every instance it serves
-    carries the sample file's one SeriesInstanceUID -- and an output table
-    grouped by that would be a single row however many series went in.
-    """
-
-    def get_instances_id_file(self, uuid: str) -> bytes:
-        ds = pydicom.dcmread(str(DATA_FILE))
-        ds.SOPInstanceUID = f"1.3.{uuid}"
-        ds.SeriesInstanceUID = f"1.2.{uuid[0]}"
-        buffer = io.BytesIO()
-        pydicom.dcmwrite(buffer, ds, enforce_file_format=True)
-        return buffer.getvalue()
-
-
 class EndToEndTest(unittest.TestCase):
     """A real Application, a real run, and only some of it committed."""
 
@@ -396,7 +385,9 @@ class EndToEndTest(unittest.TestCase):
         self._folder.cleanup()
 
     def _host(self) -> OrthancHost:
-        client = TwoSeriesOrthanc({"st1": test_host._study(
+        # The shared fake serves each instance under the series its listing
+        # gives it, so two series in means two output rows.
+        client = test_host.FakeOrthanc({"st1": test_host._study(
             [test_host._series("sA", "1"), test_host._series("sB", "2")],
             [test_host._instance("a1", "sA", "1"),
              test_host._instance("b1", "sB", "1")],

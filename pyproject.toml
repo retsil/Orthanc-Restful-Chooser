@@ -46,5 +46,6 @@ where = ["src"]
 # Application icons are data, not code, and would otherwise be left out of a
 # wheel; see __icon__ in each example.
 [tool.setuptools.package-data]
-"OrthancRC.examples.clone" = ["*.png"]
+"OrthancRC.examples.cloneimage" = ["*.png"]
+"OrthancRC.examples.cloneseries" = ["*.png"]
 "OrthancRC.examples.download" = ["*.png"]

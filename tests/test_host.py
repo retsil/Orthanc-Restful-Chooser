@@ -27,14 +27,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from OrthancRC.enums import Status  # noqa: E402
 from OrthancRC.orthanc import OrthancHost  # noqa: E402
+from OrthancRC.orthanc_util import seriesUUID, studyUUID  # noqa: E402
 
 DATA_FILE = Path(__file__).resolve().parent / "CT_small.dcm"
 
 
-def _dicomBytes(sopUID: str) -> bytes:
+def _dicomBytes(sopUID: str, **tags) -> bytes:
     """One real instance, stamped so a test can tell which one came back."""
     ds = pydicom.dcmread(str(DATA_FILE))
     ds.SOPInstanceUID = sopUID
+    for keyword, value in tags.items():
+        setattr(ds, keyword, value)
     buffer = io.BytesIO()
     pydicom.dcmwrite(buffer, ds, enforce_file_format=True)
     return buffer.getvalue()
@@ -94,7 +97,28 @@ class FakeOrthanc:
         self.release.wait(timeout=5)
         if uuid in self._failFor:
             raise RuntimeError(f"boom for {uuid}")
-        return _dicomBytes(f"1.3.{uuid}")
+        return _dicomBytes(**self._identity(uuid))
+
+    def _identity(self, uuid: str) -> dict:
+        """The UIDs the listings give an instance, for its file to carry.
+
+        A real server's file is the instance its listing describes, and the
+        host checks that it is; one it does not list is stamped 1.3.<uuid>.
+        """
+        for record, series, instances in self._studies.values():
+            for entry in instances:
+                if not isinstance(entry, dict) or entry["ID"] != uuid:
+                    continue
+                tags = {
+                    "sopUID": entry["MainDicomTags"].get("SOPInstanceUID", f"1.3.{uuid}"),
+                    "PatientID": record["PatientMainDicomTags"]["PatientID"],
+                    "StudyInstanceUID": record["MainDicomTags"]["StudyInstanceUID"],
+                }
+                for parent in series:
+                    if isinstance(parent, dict) and parent["ID"] == entry.get("ParentSeries"):
+                        tags["SeriesInstanceUID"] = parent["MainDicomTags"]["SeriesInstanceUID"]
+                return tags
+        return {"sopUID": f"1.3.{uuid}"}
 
     def hasStarted(self, uuid: str, timeout: float = 5) -> bool:
         """Whether a download for `uuid` has begun, waiting up to `timeout`."""
@@ -579,6 +603,17 @@ class SeriesSelectionTest(unittest.TestCase):
 class FromSelectionFileTest(unittest.TestCase):
     """The file says which level it is, so there is no mode argument."""
 
+    # A file holds Orthanc identifiers and refuses anything else, so the
+    # study and its series are named the way Orthanc names them.
+    ST = studyUUID("PID", "1.1.1")
+    SA = seriesUUID("PID", "1.1.1", "1.2.sA")
+    SB = seriesUUID("PID", "1.1.1", "1.2.sB")
+    STUDY = _study(
+        [_series(SA, "1", "1.2.sA"), _series(SB, "2", "1.2.sB")],
+        [_instance("a1", SA, "1"), _instance("a2", SA, "2"),
+         _instance("b1", SB, "1")],
+    )
+
     def _write(self, folder, **keys) -> str:
         path = Path(folder) / "selection.json"
         path.write_text(json.dumps({"criteria": {}, **keys}))
@@ -586,35 +621,35 @@ class FromSelectionFileTest(unittest.TestCase):
 
     def test_a_study_level_file_serves_whole_studies(self):
         with tempfile.TemporaryDirectory() as folder:
-            path = self._write(folder, study_uids=["st1"])
+            path = self._write(folder, study_uids=[self.ST])
             host = OrthancHost.fromSelectionFile(
-                FakeOrthanc({"st1": SeriesSelectionTest.STUDY}), path)
+                FakeOrthanc({self.ST: self.STUDY}), path)
 
-        self.assertEqual(host.studyUUIDs, ["st1"])
+        self.assertEqual(host.studyUUIDs, [self.ST])
         self.assertEqual(host.seriesUUIDs, {})
         self.assertEqual(host.instanceUUIDs, ["a1", "a2", "b1"])
 
     def test_a_series_level_file_serves_the_series_it_names(self):
         with tempfile.TemporaryDirectory() as folder:
             path = self._write(folder, selection_level="series",
-                               study_uids=["st1"], series_uids={"st1": ["sB"]})
+                               study_uids=[self.ST], series_uids={self.ST: [self.SB]})
             host = OrthancHost.fromSelectionFile(
-                FakeOrthanc({"st1": SeriesSelectionTest.STUDY}), path)
+                FakeOrthanc({self.ST: self.STUDY}), path)
 
         self.assertEqual(host.instanceUUIDs, ["b1"])
 
     def test_a_file_that_contradicts_itself_builds_no_host(self):
         with tempfile.TemporaryDirectory() as folder:
             path = self._write(folder, selection_level="study",
-                               study_uids=["st1"], series_uids={"st1": ["sB"]})
+                               study_uids=[self.ST], series_uids={self.ST: [self.SB]})
             with self.assertRaises(ValueError):
                 OrthancHost.fromSelectionFile(FakeOrthanc({}), path)
 
     def test_other_keywords_still_reach_the_constructor(self):
         with tempfile.TemporaryDirectory() as folder:
-            path = self._write(folder, study_uids=["st1"])
+            path = self._write(folder, study_uids=[self.ST])
             host = OrthancHost.fromSelectionFile(
-                FakeOrthanc({"st1": SeriesSelectionTest.STUDY}), path,
+                FakeOrthanc({self.ST: self.STUDY}), path,
                 uploadOutputs=False, prefetchDepth=0)
 
         self.assertFalse(host._uploadOutputs)
@@ -664,9 +699,13 @@ class OutputTest(unittest.TestCase):
         self.assertEqual(app.asked, [])
 
     def test_an_unencodable_dataset_is_reported_by_the_call_that_made_it(self):
+        # Not empty, which is refused before encoding with a message of its
+        # own, but with nothing to say how it is to be written.
+        unencodable = pydicom.Dataset()
+        unencodable.PatientName = "Doe^Jane"
         with tempfile.TemporaryDirectory() as folder:
             host = self._host(folder, uploadOutputs=False)
-            host.setApplication(self.OutputApp(ds=pydicom.Dataset()))
+            host.setApplication(self.OutputApp(ds=unencodable))
 
             self.assertFalse(host.notifyOutputAvailable("i1", True))
 
